@@ -1,0 +1,35 @@
+[project]
+name = "agent-debate"
+version = "0.1.0"
+description = "Multi-agent debate room on LiveKit with Gemini grounding + fact-checking judge"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "livekit-agents[cartesia,silero]~=1.5",
+    "livekit-api>=1.0",
+    "livekit>=1.0",
+    "google-genai>=1.0",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.4",
+    "python-dotenv>=1.0",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+dev = [
+    "honcho>=2.0",
+    "ruff>=0.6",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

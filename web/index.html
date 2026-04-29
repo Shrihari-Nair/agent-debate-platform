@@ -1,0 +1,434 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Agent Debate Room</title>
+    <style>
+      :root {
+        --bg: #0b0f1a;
+        --panel: #141b2d;
+        --panel-2: #1b2440;
+        --border: #242f54;
+        --text: #e8edf7;
+        --muted: #8a96b6;
+        --accent: #7aa2ff;
+        --accent-2: #b892ff;
+        --good: #4ade80;
+        --warn: #f59e0b;
+        --bad: #f87171;
+        --live: #60a5fa;
+      }
+      * { box-sizing: border-box; }
+      html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+      body { min-height: 100vh; display: flex; flex-direction: column; }
+      header { padding: 18px 24px; border-bottom: 1px solid var(--border); display: flex; gap: 16px; align-items: center; }
+      header h1 { font-size: 18px; margin: 0; letter-spacing: 0.02em; }
+      header .tag { background: var(--panel-2); border: 1px solid var(--border); padding: 4px 10px; border-radius: 999px; color: var(--muted); font-size: 12px; }
+      main { flex: 1; display: grid; grid-template-columns: 380px 1fr; gap: 0; }
+      aside { padding: 20px; border-right: 1px solid var(--border); background: var(--panel); overflow-y: auto; }
+      section.stage { padding: 20px; display: flex; flex-direction: column; gap: 16px; overflow: hidden; }
+      h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.1em; color: var(--muted); margin: 0 0 10px; }
+      input, textarea, button, select {
+        font: inherit; color: var(--text); background: var(--panel-2);
+        border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px;
+      }
+      input, textarea { width: 100%; }
+      textarea { resize: vertical; min-height: 60px; }
+      button { cursor: pointer; background: linear-gradient(180deg, var(--accent), var(--accent-2)); color: #0b0f1a; font-weight: 600; border: none; padding: 10px 14px; }
+      button:disabled { opacity: 0.5; cursor: not-allowed; }
+      .row { display: flex; gap: 8px; align-items: center; }
+      .field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; }
+      .field label { font-size: 12px; color: var(--muted); }
+      .debaters { display: flex; flex-direction: column; gap: 10px; margin-bottom: 12px; }
+      .debater-card { background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px; padding: 10px; }
+      .debater-card .row + .row { margin-top: 6px; }
+      .pill-btn { background: transparent; color: var(--muted); border: 1px dashed var(--border); padding: 6px 10px; border-radius: 8px; font-weight: 500; }
+      .participants { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 10px; }
+      .pcard { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 12px; display: flex; flex-direction: column; gap: 4px; transition: border-color 0.15s, box-shadow 0.15s; }
+      .pcard.active { border-color: var(--live); box-shadow: 0 0 0 2px rgba(96,165,250,0.25); }
+      .pcard.removed { opacity: 0.4; filter: grayscale(0.5); }
+      .pcard .role { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.1em; }
+      .pcard .name { font-weight: 600; }
+      .pcard .stance { font-size: 12px; color: var(--muted); margin-top: 2px; }
+      .transcript { flex: 1; overflow-y: auto; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 14px; display: flex; flex-direction: column; gap: 12px; }
+      .turn { padding: 10px 12px; background: var(--panel-2); border-radius: 10px; border: 1px solid var(--border); }
+      .turn .meta { font-size: 11px; color: var(--muted); display: flex; gap: 8px; }
+      .turn .body { margin-top: 6px; line-height: 1.5; }
+      .turn.factcheck { border-left: 3px solid var(--accent); }
+      .turn.phase { background: transparent; border: none; border-top: 1px dashed var(--border); color: var(--muted); text-align: center; text-transform: uppercase; letter-spacing: 0.1em; font-size: 12px; padding: 6px 0; }
+      .turn.removed { border-left: 3px solid var(--bad); }
+      .turn.verdict { border-left: 3px solid var(--good); background: linear-gradient(180deg, var(--panel-2), #102614); }
+      .badge { display: inline-block; padding: 2px 6px; border-radius: 999px; font-size: 11px; }
+      .badge.SUPPORTED { background: #103a23; color: var(--good); }
+      .badge.PARTIALLY_SUPPORTED { background: #3a3410; color: var(--warn); }
+      .badge.UNSUPPORTED { background: #3a2a10; color: var(--warn); }
+      .badge.CONTRADICTED { background: #3a1010; color: var(--bad); }
+      .badge.UNVERIFIABLE { background: #1b2440; color: var(--muted); }
+      .cites { margin-top: 6px; font-size: 12px; color: var(--muted); display: flex; gap: 6px; flex-wrap: wrap; }
+      .cites a { color: var(--accent); text-decoration: none; }
+      .cites a:hover { text-decoration: underline; }
+      .status { font-size: 12px; color: var(--muted); padding: 8px 10px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; }
+      .danger { color: var(--bad); }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Agent Debate Room</h1>
+      <span class="tag" id="status-tag">disconnected</span>
+      <span class="tag" id="room-tag" style="display:none"></span>
+    </header>
+
+    <main>
+      <aside id="controls">
+        <h2>Create a debate</h2>
+        <div class="field">
+          <label for="topic">Topic</label>
+          <textarea id="topic" rows="2">Should AI agents be allowed to vote in online communities?</textarea>
+        </div>
+        <h2>Debaters (2-4)</h2>
+        <div class="debaters" id="debaters"></div>
+        <button class="pill-btn" id="add-debater" type="button">+ Add debater</button>
+        <div style="margin-top: 14px">
+          <button id="start-btn" type="button">Start debate</button>
+        </div>
+        <div style="margin-top: 16px" class="status" id="ctrl-status">Fill in a topic + at least 2 debaters.</div>
+
+        <h2 style="margin-top: 24px">Participants</h2>
+        <div class="participants" id="participants"></div>
+      </aside>
+
+      <section class="stage">
+        <h2>Live transcript</h2>
+        <div class="transcript" id="transcript">
+          <div class="turn" style="text-align:center; color: var(--muted)">
+            Start a debate to begin. Audio will play automatically.
+          </div>
+        </div>
+        <div id="audio-mount" style="display:none"></div>
+      </section>
+    </main>
+
+    <script type="module">
+      import {
+        Room,
+        RoomEvent,
+        Track,
+      } from "https://esm.sh/livekit-client@2.9.0";
+
+      const ORCHESTRATOR_URL =
+        window.ORCHESTRATOR_URL || "http://localhost:8000";
+
+      const DEFAULT_DEBATERS = [
+        { slug: "pro", name: "Alex (Pro)", stance: "Yes, AI agents should have voting rights in the online communities they contribute to." },
+        { slug: "con", name: "Morgan (Con)", stance: "No, voting rights must remain exclusive to human members of online communities." },
+      ];
+
+      const state = {
+        room: null,
+        participants: new Map(), // identity -> { role, name, stance, removed }
+        turns: [],
+      };
+
+      const $ = (id) => document.getElementById(id);
+
+      function renderDebaters(list) {
+        const root = $("debaters");
+        root.innerHTML = "";
+        list.forEach((d, i) => {
+          const card = document.createElement("div");
+          card.className = "debater-card";
+          card.innerHTML = `
+            <div class="row">
+              <input data-i="${i}" data-k="name" placeholder="Display name" value="${d.name}" />
+              <input data-i="${i}" data-k="slug" placeholder="slug" value="${d.slug}" style="max-width: 120px" />
+            </div>
+            <div class="row">
+              <textarea data-i="${i}" data-k="stance" placeholder="Stance (one sentence)">${d.stance}</textarea>
+            </div>
+            <div class="row" style="justify-content:flex-end">
+              <button type="button" class="pill-btn" data-remove="${i}">remove</button>
+            </div>
+          `;
+          root.appendChild(card);
+        });
+        root.querySelectorAll("input,textarea").forEach((el) => {
+          el.addEventListener("input", (e) => {
+            const i = Number(e.target.dataset.i);
+            const k = e.target.dataset.k;
+            list[i][k] = e.target.value;
+          });
+        });
+        root.querySelectorAll("button[data-remove]").forEach((b) => {
+          b.addEventListener("click", (e) => {
+            const i = Number(e.target.dataset.remove);
+            if (list.length > 2) {
+              list.splice(i, 1);
+              renderDebaters(list);
+            }
+          });
+        });
+      }
+
+      const debaters = [...DEFAULT_DEBATERS];
+      renderDebaters(debaters);
+
+      $("add-debater").addEventListener("click", () => {
+        if (debaters.length >= 4) return;
+        debaters.push({
+          slug: `pos${debaters.length + 1}`,
+          name: `Debater ${debaters.length + 1}`,
+          stance: "",
+        });
+        renderDebaters(debaters);
+      });
+
+      function setStatus(t, variant) {
+        $("status-tag").textContent = t;
+        $("status-tag").style.color = variant === "error" ? "var(--bad)" : variant === "live" ? "var(--live)" : "var(--muted)";
+      }
+
+      function renderParticipants() {
+        const root = $("participants");
+        root.innerHTML = "";
+        for (const [identity, info] of state.participants) {
+          const card = document.createElement("div");
+          card.className = "pcard";
+          card.dataset.identity = identity;
+          if (info.active) card.classList.add("active");
+          if (info.removed) card.classList.add("removed");
+          card.innerHTML = `
+            <div class="role">${info.role || "participant"}</div>
+            <div class="name">${info.name || identity}</div>
+            ${info.stance ? `<div class="stance">${info.stance}</div>` : ""}
+            ${info.removed ? `<div class="stance danger">disqualified</div>` : ""}
+          `;
+          root.appendChild(card);
+        }
+      }
+
+      function appendTurn(el) {
+        const root = $("transcript");
+        // Drop the initial placeholder on first real entry.
+        if (state.turns.length === 0) root.innerHTML = "";
+        root.appendChild(el);
+        root.scrollTop = root.scrollHeight;
+        state.turns.push(el);
+      }
+
+      function turnSpoken(entry) {
+        const div = document.createElement("div");
+        div.className = "turn";
+        const cites = (entry.citations || [])
+          .slice(0, 5)
+          .map((s, i) => `<a href="${s.uri}" target="_blank" rel="noopener">[${i + 1}] ${(s.title || s.uri).slice(0, 80)}</a>`)
+          .join(" ");
+        div.innerHTML = `
+          <div class="meta"><strong>${entry.name}</strong> <span>· ${entry.phase}</span></div>
+          <div class="body">${escapeHtml(entry.text)}</div>
+          ${cites ? `<div class="cites">${cites}</div>` : ""}
+        `;
+        appendTurn(div);
+      }
+
+      function factCheck(ev) {
+        const div = document.createElement("div");
+        div.className = "turn factcheck";
+        const cites = (ev.citations || [])
+          .slice(0, 3)
+          .map((s, i) => `<a href="${s.uri}" target="_blank" rel="noopener">[${i + 1}]</a>`)
+          .join(" ");
+        const by = ev.by_slug || ev.slug || "?";
+        const target = ev.target_slug ? ` → ${ev.target_slug}` : "";
+        div.innerHTML = `
+          <div class="meta">
+            <span class="badge ${ev.verdict}">${ev.verdict.replace("_", " ")}</span>
+            <span>confidence ${Number(ev.confidence || 0).toFixed(2)}</span>
+            <span>· ${by}${target}</span>
+          </div>
+          <div class="body">
+            <div><em>Claim:</em> ${escapeHtml(ev.claim)}</div>
+            <div style="margin-top:4px"><em>Evidence:</em> ${escapeHtml(ev.evidence_summary || "")}</div>
+          </div>
+          ${cites ? `<div class="cites">${cites}</div>` : ""}
+        `;
+        appendTurn(div);
+      }
+
+      function phase(ev) {
+        const div = document.createElement("div");
+        div.className = "turn phase";
+        div.textContent = `— ${ev.phase.replace("_", " ")} —`;
+        appendTurn(div);
+      }
+
+      function removedNote(ev) {
+        const div = document.createElement("div");
+        div.className = "turn removed";
+        div.innerHTML = `
+          <div class="meta"><strong>${ev.slug}</strong> disqualified (${ev.reason})</div>
+          ${ev.claim ? `<div class="body"><em>Claim:</em> ${escapeHtml(ev.claim)}<br/><em>Evidence:</em> ${escapeHtml(ev.evidence || "")}</div>` : ""}
+        `;
+        appendTurn(div);
+        const info = [...state.participants.values()].find((v) => v.slug === ev.slug);
+        if (info) {
+          info.removed = true;
+          renderParticipants();
+        }
+      }
+
+      function verdictNote(ev) {
+        const div = document.createElement("div");
+        div.className = "turn verdict";
+        div.innerHTML = `
+          <div class="meta"><strong>VERDICT</strong> · winner: ${ev.winner_name || ev.winner_slug}</div>
+          <div class="body">${escapeHtml(ev.rationale || "")}</div>
+        `;
+        appendTurn(div);
+      }
+
+      function escapeHtml(s) {
+        return String(s ?? "").replace(/[&<>"']/g, (c) => ({
+          "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+        }[c]));
+      }
+
+      function handleEvent(ev) {
+        if (!ev || !ev.type) return;
+        switch (ev.type) {
+          case "debate_started":
+            // Pre-seed debater cards with stances from the authoritative config.
+            (ev.debaters || []).forEach((d) => {
+              const identity = `debater-${d.slug}`;
+              const existing = state.participants.get(identity) || {};
+              state.participants.set(identity, {
+                ...existing,
+                role: "debater",
+                name: d.name,
+                slug: d.slug,
+                stance: d.stance,
+              });
+            });
+            renderParticipants();
+            break;
+          case "phase_started":
+            phase(ev);
+            break;
+          case "turn_spoken":
+            turnSpoken(ev.entry);
+            break;
+          case "fact_check":
+            factCheck(ev);
+            break;
+          case "debater_removed":
+            removedNote(ev);
+            break;
+          case "verdict":
+            verdictNote(ev);
+            break;
+        }
+      }
+
+      async function startDebate() {
+        $("start-btn").disabled = true;
+        $("ctrl-status").textContent = "Creating room and dispatching agents...";
+        try {
+          const payload = {
+            topic: $("topic").value.trim(),
+            debaters: debaters.map((d) => ({
+              slug: d.slug.trim(),
+              name: d.name.trim(),
+              stance: d.stance.trim(),
+            })),
+          };
+          const res = await fetch(`${ORCHESTRATOR_URL}/debate`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          if (!res.ok) {
+            const err = await res.text();
+            throw new Error(err || `HTTP ${res.status}`);
+          }
+          const data = await res.json();
+          $("room-tag").textContent = data.room;
+          $("room-tag").style.display = "inline-block";
+          $("ctrl-status").textContent = `Connected to ${data.room}.`;
+          await connectToRoom(data.ws_url, data.observer_token);
+        } catch (e) {
+          $("ctrl-status").innerHTML = `<span class="danger">Error: ${escapeHtml(e.message)}</span>`;
+          $("start-btn").disabled = false;
+        }
+      }
+
+      async function connectToRoom(wsUrl, token) {
+        const room = new Room({ adaptiveStream: true, dynacast: true });
+        state.room = room;
+
+        room
+          .on(RoomEvent.Connected, () => setStatus("connected", "live"))
+          .on(RoomEvent.Disconnected, () => setStatus("disconnected"))
+          .on(RoomEvent.ParticipantConnected, (p) => {
+            const attrs = p.attributes || {};
+            const role = attrs.role || "participant";
+            const existing = state.participants.get(p.identity) || {};
+            state.participants.set(p.identity, {
+              ...existing,
+              role,
+              name: p.name || existing.name || p.identity,
+              slug: attrs.slug || existing.slug,
+              stance: attrs.stance || existing.stance,
+            });
+            renderParticipants();
+          })
+          .on(RoomEvent.ParticipantDisconnected, (p) => {
+            const info = state.participants.get(p.identity);
+            if (info) info.removed = true;
+            renderParticipants();
+          })
+          .on(RoomEvent.TrackSubscribed, (track, _pub, participant) => {
+            if (track.kind === Track.Kind.Audio) {
+              const el = track.attach();
+              el.dataset.identity = participant.identity;
+              el.autoplay = true;
+              $("audio-mount").appendChild(el);
+            }
+          })
+          .on(RoomEvent.TrackUnsubscribed, (track) => {
+            track.detach().forEach((e) => e.remove());
+          })
+          .on(RoomEvent.ActiveSpeakersChanged, (speakers) => {
+            const active = new Set(speakers.map((s) => s.identity));
+            for (const [id, info] of state.participants) {
+              info.active = active.has(id);
+            }
+            renderParticipants();
+          })
+          .on(RoomEvent.DataReceived, (payload, _participant, _kind, topic) => {
+            if (topic && topic !== "debate.event") return;
+            try {
+              const ev = JSON.parse(new TextDecoder().decode(payload));
+              handleEvent(ev);
+            } catch (e) {
+              console.warn("bad data packet", e);
+            }
+          });
+
+        await room.connect(wsUrl, token);
+        // Seed participants that are already in the room when we joined.
+        for (const [id, p] of room.remoteParticipants) {
+          const attrs = p.attributes || {};
+          state.participants.set(id, {
+            role: attrs.role || "participant",
+            name: p.name || id,
+            slug: attrs.slug,
+            stance: attrs.stance,
+          });
+        }
+        renderParticipants();
+      }
+
+      $("start-btn").addEventListener("click", startDebate);
+    </script>
+  </body>
+</html>
