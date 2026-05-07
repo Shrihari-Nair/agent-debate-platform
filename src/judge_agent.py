@@ -5,11 +5,13 @@ Orchestrates the debate:
   2. Announce the debate, then run each phase (opening → rebuttals → closing).
   3. For each debater's turn: RPC `debate.speak_turn`, collect the `TurnReply`,
      concurrently fact-check every `key_claim`.
-  4. If any claim comes back CONTRADICTED with confidence ≥ threshold, announce
-     the hallucination call, remove the debater via Room Service, and continue
-     with the survivors.
-  5. After the final phase (or when only one debater is left), render a
-     `FinalVerdict` via a schema-constrained Gemini call and read it aloud.
+  4. Hallucinated/contradicted claims are logged and penalised in the final
+     verdict scoring, but debaters are NEVER removed mid-debate. Every debater
+     speaks all phases regardless of fact-check outcomes.
+  5. After the final phase the judge renders a `FinalVerdict` via a
+     schema-constrained Gemini call and reads it aloud. Fact-check records are
+     passed to the verdict prompt so the LLM can proportionally deduct points
+     for CONTRADICTED claims without wholesale disqualification.
 
 Published data packets mirror every transcript entry + fact-check so the web
 observer can render a live transcript panel.
@@ -103,15 +105,15 @@ async def _wait_for_debater(ctx: JobContext, identity: str, timeout_s: float) ->
 
 
 async def _publish_event(room: rtc.Room, event: dict) -> None:
-    """Fire-and-forget data packet for the web observer's live transcript."""
+    """Publish a data packet for the web observer's live transcript."""
     try:
         await room.local_participant.publish_data(
             json.dumps(event).encode("utf-8"),
             reliable=True,
             topic="debate.event",
         )
-    except Exception as exc:  # pragma: no cover - observer is best-effort
-        logger.debug("publish_data failed: %s", exc)
+    except Exception as exc:
+        logger.warning("publish_data failed (event=%s): %s", event.get("type"), exc)
 
 
 def _worst_verdict_against(
@@ -120,8 +122,8 @@ def _worst_verdict_against(
     """Return the highest-confidence CONTRADICTED verdict against `target_slug`
     in this phase's collected fact-checks, if it meets the threshold.
 
-    `phase_checks[i]` is expected to contain `by_slug`, `target_slug`, and
-    FactCheck fields (`claim`, `verdict`, `confidence`, `evidence_summary`).
+    Used for the end-of-round spoken callout only — debaters are no longer
+    removed. This is kept for the judge's commentary.
     """
     best: dict | None = None
     for c in phase_checks:
@@ -253,18 +255,17 @@ async def entrypoint(ctx: JobContext) -> None:
         f"Our debaters are {intro_names}. "
         "Each round, every debater will speak, and in the rebuttal rounds "
         "they will also fact-check one of their opponent's claims. "
-        "I will not interrupt during a round. At the end of each round I will "
-        "review the fact-checks and disqualify anyone whose claims were "
-        "clearly contradicted by evidence. At the end, I will pick a winner "
-        "based purely on the quality of their argumentation. Let's begin."
+        "I will not interrupt during a round. Debaters are never disqualified "
+        "mid-debate — every side gets to make their full case. At the end I will "
+        "weigh all the arguments and fact-check records to pick a winner. "
+        "Let's begin."
     )
     await _publish_event(
         ctx.room,
         {"type": "debate_started", "topic": topic, "debaters": [d.model_dump() for d in debaters]},
     )
 
-    # 2. Main phase loop. Each phase is one round; the judge collects every
-    # debater's peer fact-check and evaluates them ALL at end of phase.
+    # 2. Main phase loop.
     for phase in phases:
         if len(alive) <= 1:
             break
@@ -273,7 +274,7 @@ async def entrypoint(ctx: JobContext) -> None:
         await _publish_event(ctx.room, {"type": "phase_started", "phase": phase})
 
         phase_factchecks: list[dict] = []
-        round_slugs = list(alive)  # snapshot: nobody disqualified mid-round
+        round_slugs = list(alive)  # snapshot
 
         for slug in round_slugs:
             spec = debater_by_slug[slug]
@@ -320,12 +321,25 @@ async def entrypoint(ctx: JobContext) -> None:
                 citations=reply.citations,
             )
             transcript.append(entry)
+            # Truncate citations to 5 to keep the data packet small (<15 KB)
+            entry_for_event = TranscriptEntry(
+                slug=slug,
+                name=spec.name,
+                phase=phase,
+                text=reply.text,
+                key_claims=reply.key_claims,
+                citations=reply.citations[:5],
+            )
             await _publish_event(
                 ctx.room,
-                {"type": "turn_spoken", "entry": entry.model_dump()},
+                {"type": "turn_spoken", "entry": entry_for_event.model_dump()},
+            )
+            logger.info(
+                "judge: published turn_spoken slug=%s phase=%s chars=%d",
+                slug, phase, len(reply.text),
             )
 
-            # Accumulate the peer fact-check for end-of-round evaluation.
+            # Accumulate the peer fact-check for end-of-round commentary.
             if reply.fact_check is not None and reply.target_slug:
                 record = {
                     "phase": phase,
@@ -347,83 +361,69 @@ async def entrypoint(ctx: JobContext) -> None:
                     reply.fact_check.confidence,
                 )
 
-        # 3. End-of-round adjudication. Only disqualify on CONTRADICTED with
-        # confidence >= threshold. Never mid-phase.
-        if phase_factchecks:
-            await session.say(
-                "The round is complete. Let me review the fact-checks raised."
-            )
-        # Evaluate one target at a time so the ruling speech stays coherent.
-        already_removed_this_phase: set[str] = set()
+        # 3. End-of-round: call out CONTRADICTED claims as a spoken note but
+        # do NOT remove any debater. They continue in all remaining phases.
+        contradicted_this_round: list[tuple[str, dict]] = []
         for target in round_slugs:
-            if target in already_removed_this_phase:
-                continue
             hit = _worst_verdict_against(phase_factchecks, target, threshold)
-            if hit is None:
-                continue
-            target_name = debater_by_slug[target].name
-            accuser_name = debater_by_slug.get(hit["by_slug"], DebaterSpec(slug=hit["by_slug"], name=hit["by_slug"], stance="unknown")).name
-            ruling = (
-                f"I'm calling a hallucination against {target_name}, based on "
-                f"the fact-check raised by {accuser_name}. The claim in question — "
-                f"\"{hit['claim']}\" — is contradicted by the evidence. "
-                f"{hit.get('evidence_summary', '').strip()} "
-                f"{target_name} is disqualified from this debate."
-            )
-            logger.info("judge: disqualifying debater-%s for %r", target, hit["claim"])
-            await session.say(ruling)
-            if target in alive:
-                alive.remove(target)
-            already_removed_this_phase.add(target)
-            await _publish_event(
-                ctx.room,
-                {
-                    "type": "debater_removed",
-                    "slug": target,
-                    "reason": "hallucination",
-                    "by_slug": hit["by_slug"],
-                    "claim": hit["claim"],
-                    "evidence": hit.get("evidence_summary", ""),
-                },
-            )
-            await _remove_participant(room_name, f"debater-{target}")
-            if len(alive) <= 1:
-                break
+            if hit:
+                contradicted_this_round.append((target, hit))
 
-    # 4. Final verdict.
-    if len(alive) == 1:
-        last_slug = alive[0]
-        last_name = debater_by_slug[last_slug].name
-        verdict_text = (
-            f"With only {last_name} remaining after disqualifications, "
-            f"{last_name} wins by default. The debate is concluded."
+        if contradicted_this_round:
+            await session.say("The round is complete. Let me flag some fact-check findings.")
+            for target, hit in contradicted_this_round:
+                target_name = debater_by_slug[target].name
+                accuser_name = debater_by_slug.get(
+                    hit["by_slug"],
+                    DebaterSpec(slug=hit["by_slug"], name=hit["by_slug"], stance="unknown")
+                ).name
+                logger.warning(
+                    "judge: CONTRADICTED claim by debater-%s — %r (conf=%.2f) — "
+                    "noted for final verdict, NOT disqualified",
+                    target, hit["claim"], hit["confidence"],
+                )
+                await session.say(
+                    f"I'm noting a disputed claim against {target_name}: "
+                    f"the assertion — '{hit['claim']}' — was challenged by {accuser_name} "
+                    f"and the evidence does not support it. "
+                    f"I'll factor this into my final verdict. "
+                    f"Both debaters continue."
+                )
+
+    # 4. Final verdict — all debaters considered, fact-check records included.
+    def _render_factcheck_summary(fcs: list[dict]) -> str:
+        if not fcs:
+            return "(no fact-checks raised)"
+        lines = []
+        for fc in fcs:
+            lines.append(
+                f"[{fc['phase']}] {fc['by_slug']} checked {fc['target_slug']}: "
+                f"{fc['verdict']} (conf={fc.get('confidence', 0):.2f}) — "
+                f"{fc.get('claim', '')[:120]}"
+            )
+        return "\n".join(lines)
+
+    try:
+        final = await structured_generate(
+            final_verdict_prompt(
+                topic=topic,
+                transcript_text=_render_transcript(transcript),
+                debater_names={d.slug: d.name for d in debaters},
+                factcheck_summary=_render_factcheck_summary(factchecks),
+            ),
+            schema=FinalVerdict,
+            temperature=0.2,
         )
+    except Exception as exc:
+        logger.exception("judge: final verdict generation failed")
         final = FinalVerdict(
-            winner_slug=last_slug,
-            scores=[ScoreEntry(slug=last_slug, score=1.0)] + [ScoreEntry(slug=s, score=0.0) for s in debater_by_slug if s != last_slug],
-            rationale=verdict_text,
+            winner_slug=alive[0] if alive else debaters[0].slug,
+            scores=[ScoreEntry(slug=s, score=0.5) for s in alive],
+            rationale=(
+                "I was unable to render a conclusive verdict due to a "
+                "technical issue. Thank you to all debaters."
+            ),
         )
-    else:
-        try:
-            final = await structured_generate(
-                final_verdict_prompt(
-                    topic=topic,
-                    transcript_text=_render_transcript(transcript),
-                    debater_names={d.slug: d.name for d in debaters if d.slug in alive},
-                ),
-                schema=FinalVerdict,
-                temperature=0.2,
-            )
-        except Exception as exc:
-            logger.exception("judge: final verdict generation failed")
-            final = FinalVerdict(
-                winner_slug=alive[0] if alive else debaters[0].slug,
-                scores=[ScoreEntry(slug=s, score=0.5) for s in alive],
-                rationale=(
-                    "I was unable to render a conclusive verdict due to a "
-                    "technical issue. Thank you to all debaters."
-                ),
-            )
 
     winner_name = debater_by_slug.get(final.winner_slug).name if final.winner_slug in debater_by_slug else final.winner_slug
     await session.say(

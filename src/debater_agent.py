@@ -35,6 +35,7 @@ from livekit.agents import (
 from livekit.plugins import cartesia
 
 from .argument_generator import build_turn
+from .memory import DebateMemory
 from .personas import voice_for_slug
 from .schemas import TurnReply, TurnRequest
 
@@ -106,6 +107,10 @@ async def entrypoint(ctx: JobContext) -> None:
     )
     await session.start(room=ctx.room, agent=agent)
 
+    # One DebateMemory instance per job — accumulates episodic context
+    # across all turns in this debate and compresses older phases automatically.
+    debate_memory = DebateMemory(my_slug=slug)
+
     rpc_lock = asyncio.Lock()
 
     @ctx.room.local_participant.register_rpc_method("debate.speak_turn")
@@ -132,6 +137,7 @@ async def entrypoint(ctx: JobContext) -> None:
                     transcript=req.transcript,
                     last_opponent_text=req.last_opponent_text,
                     allow_fact_check=req.allow_fact_check,
+                    memory=debate_memory,
                 )
             except Exception as exc:
                 logger.exception("debater[%s] argument generation failed", slug)

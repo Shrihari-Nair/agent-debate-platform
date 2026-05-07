@@ -64,6 +64,10 @@ async def grounded_generate(prompt: str, temperature: float = 0.2) -> tuple[str,
     Returns (evidence_text, citations). Never mixes with function tools or
     `response_schema` — that's the whole reason this helper exists.
     """
+    logger.info(
+        "gemini[phase-1/grounded]: → calling model=%s  prompt_chars=%d  temp=%.1f",
+        settings.debate_model, len(prompt), temperature,
+    )
     client = get_client()
     response = await client.aio.models.generate_content(
         model=settings.debate_model,
@@ -75,6 +79,10 @@ async def grounded_generate(prompt: str, temperature: float = 0.2) -> tuple[str,
     )
     text = response.text or ""
     sources = extract_sources(response)
+    logger.info(
+        "gemini[phase-1/grounded]: ✓ received  evidence_chars=%d  sources=%d",
+        len(text), len(sources),
+    )
     return text, sources
 
 
@@ -88,6 +96,11 @@ async def structured_generate(
     `schema` is a Pydantic class; the SDK auto-converts it to Gemini's OpenAPI
     subset and returns an auto-validated instance on `response.parsed`.
     """
+    schema_name = getattr(schema, "__name__", str(schema))
+    logger.info(
+        "gemini[phase-2/structured]: → calling model=%s  schema=%s  prompt_chars=%d  temp=%.1f",
+        settings.debate_model, schema_name, len(prompt), temperature,
+    )
     client = get_client()
     response = await client.aio.models.generate_content(
         model=settings.debate_model,
@@ -106,4 +119,8 @@ async def structured_generate(
             "structured_generate: response.parsed was None, falling back to JSON text"
         )
         return schema.model_validate_json(response.text or "{}")
+    logger.info(
+        "gemini[phase-2/structured]: ✓ parsed  schema=%s",
+        schema_name,
+    )
     return parsed

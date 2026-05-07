@@ -139,3 +139,133 @@ class FinalVerdict(BaseModel):
     rationale: str = Field(
         description="Plain-spoken verdict, 2-4 sentences, will be read aloud."
     )
+
+
+# ---------------------------------------------------------------------------
+# New schemas for Reflection Loop, Episodic Memory, and Plan-and-Execute
+# ---------------------------------------------------------------------------
+
+
+class ArgumentCritique(BaseModel):
+    """LangChain/LangGraph structured output for the self-critique node.
+
+    The reflection graph's critique node uses this as its `with_structured_output`
+    target.  Scores are 0.0–1.0.  `should_revise` drives the conditional edge.
+    """
+
+    stance_adherence: float = Field(
+        ge=0.0,
+        le=1.0,
+        description=(
+            "How strongly the argument commits to the debater's assigned stance. "
+            "1.0 = never concedes; 0.0 = flip-flopped."
+        ),
+    )
+    factual_density: float = Field(
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Fraction of the argument backed by concrete, specific evidence "
+            "(numbers, dates, named entities). 1.0 = every claim grounded."
+        ),
+    )
+    rebuttal_strength: float = Field(
+        ge=0.0,
+        le=1.0,
+        description=(
+            "How effectively the argument attacks or neutralises the opponent's "
+            "last turn. 1.0 = devastating rebuttal; 0.0 = ignored the opponent."
+        ),
+    )
+    weaknesses: list[str] = Field(
+        default_factory=list,
+        max_length=4,
+        description=(
+            "Short, specific improvement notes (e.g. 'statistic on line 3 needs "
+            "a date', 'opening sentence concedes the opponent's frame'). "
+            "Empty if no revision needed."
+        ),
+    )
+    should_revise: bool = Field(
+        description=(
+            "True if ANY score is below 0.65 or if there are important weaknesses "
+            "that a single revision pass would likely fix."
+        ),
+    )
+
+
+class DebateStrategy(BaseModel):
+    """LangGraph plan-and-execute output — one turn's tactical plan.
+
+    Produced by `src/planner.py` before argument generation and injected into
+    both the Phase-1 research prompt (via `evidence_keywords`) and the Phase-2
+    composition prompt (via `rhetorical_angle` + `claims_to_make`).
+    """
+
+    primary_attack: str | None = Field(
+        default=None,
+        description=(
+            "The single most vulnerable claim in the opponent's last turn to target. "
+            "None for the opening phase (no opponent yet)."
+        ),
+    )
+    evidence_keywords: list[str] = Field(
+        default_factory=list,
+        max_length=6,
+        description=(
+            "Search keywords that will maximise the quality of the Phase-1 "
+            "Google Search grounding call for this specific turn."
+        ),
+    )
+    rhetorical_angle: str = Field(
+        default="balanced",
+        description=(
+            "One of: 'statistical' (lead with numbers/data), "
+            "'narrative' (use a concrete real-world example), "
+            "'authority' (cite expert consensus), "
+            "'reductio' (show the opponent's position leads to an absurd conclusion), "
+            "'balanced' (no specific angle)."
+        ),
+    )
+    claims_to_make: list[str] = Field(
+        default_factory=list,
+        max_length=3,
+        description=(
+            "2–3 specific claims the debater should aim to make this turn, "
+            "derived from the opponent's weaknesses and own past strong points."
+        ),
+    )
+    opponent_weak_points: list[str] = Field(
+        default_factory=list,
+        max_length=3,
+        description=(
+            "Patterns observed in the opponent's arguments that can be exploited "
+            "across this and future turns."
+        ),
+    )
+
+
+class VerifiedClaims(BaseModel):
+    """Output of the post-Phase-2 claim grounding verification pass.
+
+    Each key_claim produced by Phase 2 is checked against the actual Phase-1
+    evidence text.  Claims that are directly supported (possibly with minor
+    number/date corrections to match the evidence exactly) land in `verified`.
+    Any claim that is extrapolated, invented, or contradicted by the evidence
+    lands in `removed` and is never passed to the judge.
+    """
+
+    verified: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Claims that are directly and explicitly supported by the evidence. "
+            "Minor corrections (e.g. exact number from the source) are applied."
+        ),
+    )
+    removed: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Claims that were not directly found in the evidence — hallucinated, "
+            "extrapolated, or contradicted.  Logged for debugging."
+        ),
+    )

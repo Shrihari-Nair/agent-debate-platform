@@ -83,13 +83,45 @@ def compose_argument_prompt(
         "- 40 to 90 seconds of spoken text (roughly 100-220 words).\n"
         "- Conversational, confident, no stage directions, no markdown.\n"
         "- Weave in 1-3 specific facts from the evidence (numbers, dates, names).\n"
-        "- Extract the atomic factual claims you made into `key_claims`; each should "
-        "  be a single checkable sentence with a specific number/date/named entity.\n"
+        "- STRICT GROUNDING RULE: Every specific fact you state (any number, date, "
+        "  percentage, or named statistic) MUST appear explicitly in the "
+        "  'Pre-researched web evidence' block above. Do NOT invent, extrapolate, "
+        "  round, or recall any figure from your training data — use only what is "
+        "  written in the evidence block verbatim.\n"
+        "- Extract the atomic factual claims you made into `key_claims`. Each must:\n"
+        "  (a) be a single checkable sentence with a specific number/date/named entity,\n"
+        "  (b) be traceable word-for-word to the evidence block above.\n"
+        "  Do NOT include any claim whose specific figures are not explicitly stated "
+        "  in the evidence. Omit rhetorical points and opinions from key_claims.\n"
         "- CRITICAL: You are COMMITTED to the position stated in 'Your side' above. "
         "  You must NEVER agree with, support, or switch to the opponent's position. "
         "  Do not concede your core stance under any circumstances. You may "
         "  acknowledge a narrow factual point only to immediately reframe it in "
         "  favour of YOUR side."
+    )
+
+
+def verify_claims_prompt(key_claims: list[str], evidence: str, argument_text: str) -> str:
+    claims_block = "\n".join(f"{i + 1}. {c}" for i, c in enumerate(key_claims))
+    return (
+        "You are a strict fact-auditor for a debate system.\n\n"
+        "EVIDENCE (retrieved via live Google Search — this is your ONLY source of truth):\n"
+        f"<<<\n{evidence}\n>>>\n\n"
+        "ARGUMENT TEXT (what the debater said):\n"
+        f"<<<\n{argument_text}\n>>>\n\n"
+        "KEY CLAIMS to audit:\n"
+        f"{claims_block}\n\n"
+        "For EACH claim above:\n"
+        "  KEEP it in `verified` if every specific fact in it (number, date, %, "
+        "  named entity) is directly and explicitly stated in the EVIDENCE block. "
+        "  You may make minor wording corrections to match the evidence exactly "
+        "(e.g. fix a wrong year or percentage to what the evidence actually says).\n"
+        "  MOVE it to `removed` if:\n"
+        "    - any specific figure in it does not appear in the evidence, OR\n"
+        "    - it is a generalisation, extrapolation, or recalled from training data, OR\n"
+        "    - it contradicts what the evidence says.\n"
+        "Be strict: when in doubt, remove. It is better to present fewer verified "
+        "claims than to risk a CONTRADICTED verdict from the judge's fact-checker."
     )
 
 
@@ -124,21 +156,34 @@ def judge_claim_prompt(claim: str, evidence: str, sources_block: str) -> str:
     )
 
 
-def final_verdict_prompt(topic: str, transcript_text: str, debater_names: dict[str, str]) -> str:
+def final_verdict_prompt(
+    topic: str,
+    transcript_text: str,
+    debater_names: dict[str, str],
+    factcheck_summary: str = "",
+) -> str:
     names_block = "\n".join(f"- {slug}: {name}" for slug, name in debater_names.items())
+    fc_block = (
+        f"Fact-check records from the debate (claims opponents challenged):\n"
+        f"<<<\n{factcheck_summary}\n>>>\n\n"
+        if factcheck_summary
+        else ""
+    )
     return (
         f"You are the judge of a debate on: {topic}\n\n"
         f"Debaters:\n{names_block}\n\n"
         f"Full transcript:\n<<<\n{transcript_text}\n>>>\n\n"
-        "Score each debater from 0.0 to 1.0 based PURELY on the quality of their "
+        f"{fc_block}"
+        "Score each debater from 0.0 to 1.0 based on the quality of their "
         "argumentation: clarity of reasoning, persuasive structure, rebuttal "
-        "effectiveness, and rhetorical strength. You are NOT doing fact-checking "
-        "here — the debaters have already fact-checked one another during the "
-        "debate, and any hallucinators have been disqualified. Judge the "
-        "remaining arguments on their merits. Pick a single winner_slug from "
-        "the debaters listed above. Write a 2-4 sentence rationale that will "
-        "be READ ALOUD — conversational, authoritative, no markdown, no stage "
-        "directions."
+        "effectiveness, and rhetorical strength.\n"
+        "If the fact-check records show that a debater had claims marked "
+        "CONTRADICTED, deduct points proportionally — but do NOT disqualify. "
+        "A debater with mostly strong arguments and one wrong stat should still "
+        "score higher than one with weak arguments overall.\n"
+        "Pick a single winner_slug from the debaters listed above. Write a 2-4 "
+        "sentence rationale that will be READ ALOUD — conversational, "
+        "authoritative, no markdown, no stage directions."
     )
 
 
