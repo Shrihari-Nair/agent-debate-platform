@@ -24,6 +24,7 @@ Graph shape:
 from __future__ import annotations
 
 import logging
+from datetime import date
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import END, START, StateGraph
@@ -128,6 +129,7 @@ def plan_node(state: PlanState) -> dict:
     transcript_block = _render_recent_transcript(state["transcript"], state["my_slug"])
 
     prompt = (
+        f"Today's date: {date.today().strftime('%B %-d, %Y')}. All reasoning and search keywords must reflect this date.\n\n"
         f"You are a debate strategist planning ONE turn for a competitive debate.\n\n"
         f"Topic: {state['topic']}\n"
         f"My stance: {state['stance']}\n"
@@ -140,7 +142,10 @@ def plan_node(state: PlanState) -> dict:
         f"{'- primary_attack: null (opening phase)' if is_opening else '- primary_attack: identify the single weakest specific claim in the opponent last turn'}\n"
         f"- evidence_keywords: 3–6 specific search keywords that will find the "
         f"  best evidence for this turn (be precise — include dates, proper nouns, "
-        f"  field names)\n"
+        f"  field names). IMPORTANT: if the topic involves current events, elections, "
+        f"  policies, or ongoing situations, you MUST include '{date.today().year}' "
+        f"  as one of the keywords so the Google Search retrieves {date.today().year} results, "
+        f"  not older ones.\n"
         f"- rhetorical_angle: choose one that fits: statistical / narrative / "
         f"  authority / reductio / balanced\n"
         f"- claims_to_make: 2–3 specific claims you should try to establish this "

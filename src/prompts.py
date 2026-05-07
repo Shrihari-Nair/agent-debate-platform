@@ -7,9 +7,18 @@ Design notes:
   schema-constrained output (Argument or FactCheck).
 - We never ask the model to invent citations; citations come exclusively from
   `grounding_metadata.grounding_chunks` of the phase-1 call.
+- Every search-driving prompt includes the current date so Google Search
+  results are anchored to the correct year, not the model's training cutoff.
 """
 
 from __future__ import annotations
+
+from datetime import date
+
+
+def _today() -> str:
+    """Return today's date as a human-readable string, e.g. 'May 7, 2026'."""
+    return date.today().strftime("%B %-d, %Y")
 
 PHASE_INSTRUCTIONS: dict[str, str] = {
     "opening": (
@@ -42,15 +51,18 @@ def ground_topic_prompt(topic: str, stance: str, phase: str, last_opponent: str 
         else "No opponent turn yet.\n"
     )
     return (
+        f"Today's date: {_today()}. All research must reflect events up to and including this date.\n"
         "You are researching live web evidence to support an upcoming debate argument.\n"
         f"Debate topic: {topic}\n"
         f"Your side: {stance}\n"
         f"Upcoming phase: {phase} — {phase_hint}\n\n"
         f"{last}"
-        "Search the web for CURRENT, authoritative evidence that supports your side "
-        "OR refutes the opponent's last claim. For each finding, state the specific "
-        "fact (dates, numbers, named entities) and which source it came from. Do NOT "
-        "write the argument yet — this is research notes only."
+        f"Search the web for the MOST RECENT, authoritative evidence (prioritise {date.today().year} sources) "
+        "that supports your side OR refutes the opponent's last claim. "
+        "If the topic refers to current events (elections, policies, ongoing conflicts, market data), "
+        f"your search queries MUST include the year {date.today().year} to retrieve up-to-date results. "
+        "For each finding, state the specific fact (dates, numbers, named entities) and which source "
+        "it came from. Do NOT write the argument yet — this is research notes only."
     )
 
 
@@ -127,6 +139,7 @@ def verify_claims_prompt(key_claims: list[str], evidence: str, argument_text: st
 
 def ground_claim_prompt(claim: str) -> str:
     return (
+        f"Today's date: {_today()}. Prioritise sources from {date.today().year} when available.\n"
         "You are a research assistant gathering evidence to fact-check a single claim.\n"
         f"CLAIM: {claim}\n\n"
         "Search the web for current, authoritative evidence that either supports or "
