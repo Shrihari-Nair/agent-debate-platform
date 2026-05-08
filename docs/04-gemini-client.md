@@ -180,6 +180,67 @@ async def grounded_generate(prompt: str, temperature: float = 0.2) -> tuple[str,
 
 ---
 
+## Phase 1 Streaming: `grounded_generate_stream()`
+
+```python
+async def grounded_generate_stream(
+    prompt: str,
+    temperature: float = 0.2,
+    on_chunk: Callable[[str], Awaitable[None]] | None = None,
+) -> tuple[str, list[Source]]:
+```
+
+Identical semantics to `grounded_generate` — same return type, same Google Search grounding — but with an optional `on_chunk` callback that fires as tokens arrive.
+
+### Why Streaming for Phase 1 Only?
+
+Phase 2 returns structured JSON. The JSON must be **complete** before it can be parsed as a valid Pydantic object. There is no way to partially parse half a JSON document, so Phase 2 cannot stream.
+
+Phase 1 returns free text (research notes). Each sentence is useful on its own. Streaming Phase 1 lets the browser show what the debater is researching in real time — before a single word of the actual argument has been composed.
+
+### How `on_chunk` Works
+
+```python
+async for chunk in await client.aio.models.generate_content_stream(
+    model=settings.debate_model,
+    contents=prompt,
+    config=types.GenerateContentConfig(
+        tools=[_google_search_tool()],
+        temperature=temperature,
+    ),
+):
+    last_chunk = chunk
+    token = chunk.text or ""
+    if token:
+        full_text += token
+        _batch += token
+        # Fire callback when batch reaches ~80 chars or ends a sentence
+        if on_chunk is not None and (len(_batch) >= 80 or token[-1] in ".!?\n"):
+            await on_chunk(_batch)
+            _batch = ""
+```
+
+Raw SDK chunks can be very small (a few characters). Batching to ~80 characters or sentence boundaries reduces the number of network packets the debater sends to the room without making the UI feel choppy.
+
+Grounding metadata (the source URLs) only arrives in the **last** chunk. The function tracks `last_chunk` and calls `extract_sources(last_chunk)` after the loop.
+
+### Fallback Behaviour
+
+If `on_chunk is None`, the function immediately delegates to `grounded_generate()` (the non-streaming version). This means callers that do not need streaming get identical behaviour with no code change.
+
+### Callback Error Isolation
+
+```python
+try:
+    await on_chunk(_batch)
+except Exception as cb_exc:
+    logger.debug("gemini[phase-1/stream]: on_chunk callback error: %s", cb_exc)
+```
+
+Errors in `on_chunk` (e.g. LiveKit `publish_data` failing because no observers are present) are logged at DEBUG and swallowed. The generation pipeline continues regardless. A broken observer never kills the argument generation.
+
+---
+
 ## Phase 2: `structured_generate()`
 
 ```python

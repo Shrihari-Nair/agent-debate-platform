@@ -121,71 +121,82 @@ rpc_lock = asyncio.Lock()
 
 @ctx.room.local_participant.register_rpc_method("debate.speak_turn")
 async def speak_turn(data: rtc.RpcInvocationData) -> str:
-    caller = data.caller_identity
-    logger.info("debater[%s] speak_turn invoked by %s", slug, caller)
-
-    async with rpc_lock:
-        try:
-            req = TurnRequest.model_validate_json(data.payload)
-        except Exception as exc:
-            raise rtc.RpcError(
-                code=400, message=f"invalid TurnRequest payload: {exc}"
-            ) from exc
-
-        try:
-            spoken, argument, citations, fact_check, target_slug = await build_turn(
-                topic=req.topic or topic,
-                stance=req.my_stance or stance,
-                phase=req.phase,
-                my_slug=req.my_slug or slug,
-                transcript=req.transcript,
-                last_opponent_text=req.last_opponent_text,
-                allow_fact_check=req.allow_fact_check,
-            )
-        except Exception as exc:
-            logger.exception("debater[%s] argument generation failed", slug)
-            raise rtc.RpcError(code=500, message=f"generation failed: {exc}") from exc
-
-        handle = await session.say(spoken, allow_interruptions=False)
-        try:
-            await handle.wait_for_playout()
-        except Exception as exc:
-            logger.warning("debater[%s] wait_for_playout error: %s", slug, exc)
-
-        reply = TurnReply(
-            text=spoken,
-            key_claims=argument.key_claims,
-            citations=citations,
-            fact_check=fact_check,
-            target_slug=target_slug,
-        )
-        return reply.model_dump_json()
 ```
 
-This is the most important function in the debater agent. Let's trace through it step by step.
+This is the most important function in the debater agent. Here is the full execution order:
 
-### `@ctx.room.local_participant.register_rpc_method("debate.speak_turn")`
+1. Deserialise `TurnRequest` from the RPC payload
+2. **Publish `turn_text_start`** — creates the UI card immediately, before any work starts
+3. Call `build_turn(...)` with `on_status` and `on_research_chunk` callbacks
+4. Publish `research_done` — attaches sources to the research panel
+5. Stream text sentence-by-sentence with 50ms pacing
+6. Publish `turn_text_end` — removes the typing cursor
+7. Call `session.say()` to start TTS audio
+8. `await handle.wait_for_playout()` — blocks until audio finishes
+9. Return `TurnReply` JSON to the judge
 
-This decorator registers `speak_turn` as the handler for incoming RPC calls with the method name `"debate.speak_turn"`. When the judge calls `perform_rpc(method="debate.speak_turn", ...)`, this function runs.
+---
 
-### `rpc_lock = asyncio.Lock()`
+### Why `turn_text_start` Comes First
 
-An `asyncio.Lock` ensures this function runs one call at a time. Although the judge should not call a debater twice simultaneously, this lock prevents any edge case where concurrent RPC calls could overlap.
+All streaming events — `turn_status` (pipeline step badges) and `research_chunk` (live evidence tokens) — fire **during** `build_turn`. The frontend looks up an existing card by `slug:phase` key to attach these events. If the card does not exist yet, the events are silently discarded.
 
-What is an `asyncio.Lock`? It is a mutual exclusion mechanism for async code. `async with rpc_lock:` acquires the lock when entering the block and releases it when exiting. If a second caller tries to acquire the lock while the first is inside, it waits.
+Publishing `turn_text_start` before `build_turn` ensures the card exists from the very first moment the debater starts thinking, so every subsequent event lands visibly.
 
-### `TurnRequest.model_validate_json(data.payload)`
+---
 
-Deserialises the JSON string from the RPC payload into a `TurnRequest` Pydantic object. If the JSON is invalid or missing required fields, raises an `rtc.RpcError(code=400)` — the judge sees this as an RPC failure and forfeits the turn.
+### Streaming Callbacks
 
-### `await build_turn(...)`
+```python
+async def _on_status(label: str) -> None:
+    await _publish_to_room(ctx.room, {
+        "type": "turn_status",
+        "slug": slug, "name": name,
+        "phase": current_phase, "status": label,
+    })
 
-Delegates all the actual intelligence to `argument_generator.build_turn()`. See [09-argument-generator.md](./09-argument-generator.md) for the full breakdown. Returns 5 values:
-- `spoken` — the full text to say (argument + optional fact-check callout)
-- `argument` — the `Argument` Pydantic object
-- `citations` — web sources
-- `fact_check` — the `FactCheck` result (or `None`)
-- `target_slug` — which debater was fact-checked (or `None`)
+async def _on_research_chunk(text: str) -> None:
+    await _publish_to_room(ctx.room, {
+        "type": "research_chunk",
+        "slug": slug, "name": name,
+        "phase": current_phase, "text": text,
+    })
+```
+
+Both are closures over `ctx.room`, `slug`, `name`, and `current_phase` — values captured at call time. They are passed to `build_turn` which fires them at the right moments.
+
+---
+
+### Text Streaming
+
+```python
+sentences = [s.strip() for s in _SENTENCE_SPLIT_RE.split(spoken) if s.strip()]
+for sentence in sentences:
+    await _publish_to_room(ctx.room, {
+        "type": "turn_text_chunk", ..., "text": sentence + " ",
+    })
+    await asyncio.sleep(0.05)  # 50 ms typewriter pacing
+await _publish_to_room(ctx.room, {"type": "turn_text_end", ...})
+```
+
+After `build_turn` returns, the full spoken text is split on sentence boundaries and published 50ms per sentence. The entire text appears in the browser within ~500ms (a 10-sentence argument takes ~0.5s). TTS audio starts immediately after — so the user reads the text, then hears it spoken.
+
+This is intentionally sequential (not concurrent with TTS). Trying to pace text in sync with live audio proved unreliable because `wait_for_playout()` does not cooperate with the asyncio event loop consistently enough for accurate interleaving.
+
+---
+
+### Error Handling
+
+If `build_turn` raises:
+
+```python
+except Exception as exc:
+    # Clean up the pending card
+    await _publish_to_room(ctx.room, {"type": "turn_text_end", ...})
+    raise rtc.RpcError(code=500, message=f"generation failed: {exc}") from exc
+```
+
+A `turn_text_end` is published to remove the typing cursor from the empty card, preventing a stuck spinner in the UI. The judge's RPC caller sees `RpcError(500)` and announces the forfeit.
 
 ### `session.say()` and `wait_for_playout()`
 
@@ -217,6 +228,37 @@ return reply.model_dump_json()
 ```
 
 `model_dump_json()` serialises the `TurnReply` to a JSON string. RPC responses must be strings. The judge deserialises it with `TurnReply.model_validate_json(reply_json)`.
+
+---
+
+## `_publish_to_room()` — The Debater's Event Publisher
+
+```python
+async def _publish_to_room(room: rtc.Room, event: dict) -> None:
+    try:
+        await room.local_participant.publish_data(
+            json.dumps(event).encode("utf-8"),
+            reliable=True,
+            topic="debate.event",
+        )
+    except Exception as exc:
+        logger.warning("debater: publish_to_room failed (event=%s): %s",
+                       event.get("type"), exc)
+```
+
+Debater agents publish their own streaming events directly to the room using the same `"debate.event"` topic as the judge. This means the browser's `DataReceived` handler sees both debater and judge events through a single `handleEvent()` dispatcher.
+
+Failures are logged at WARNING (not DEBUG) and swallowed — a broken publish never kills the turn pipeline.
+
+---
+
+## `DebateMemory` Per Job
+
+```python
+debate_memory = DebateMemory(my_slug=slug)
+```
+
+Created once in `entrypoint()` before RPC registration. The same instance is passed to every `build_turn()` call throughout the job, accumulating episodic context across all turns. Each debater job has its own isolated `DebateMemory` — they do not share a vector index. See [memory.py](../src/memory.py).
 
 ---
 

@@ -23,6 +23,22 @@ target_slug    — which opponent was fact-checked (or None)
 
 ---
 
+## Callback Type Aliases
+
+```python
+StatusCallback = Callable[[str], Awaitable[None]] | None
+ChunkCallback  = Callable[[str], Awaitable[None]] | None
+```
+
+These are module-level type aliases used in `build_turn` and `_generate_argument_core` signatures. They represent optional async callbacks:
+
+- **`StatusCallback`** — called with a short label string at each pipeline step boundary (e.g. `"researching"`, `"reflecting"`). Used by the debater agent to publish `turn_status` events to the frontend.
+- **`ChunkCallback`** — called with batches of raw Phase-1 token text as they arrive from the Gemini streaming API. Used to publish `research_chunk` events to the frontend in real time.
+
+All callbacks degrade gracefully: exceptions inside them are caught and logged so a broken observer never kills the pipeline.
+
+---
+
 ## The Concurrency Pattern
 
 The most important design in this file is that argument generation and fact-checking run **concurrently** (at the same time):
@@ -114,75 +130,35 @@ async def _generate_argument_core(
     phase: str,
     transcript: list[TranscriptEntry],
     last_opponent_text: str | None,
-) -> tuple[Argument, list[Source]]:
-    evidence, sources = await grounded_generate(
-        ground_topic_prompt(topic, stance, phase, last_opponent_text),
-        temperature=0.2,
-    )
-    argument = await structured_generate(
-        compose_argument_prompt(
-            topic=topic,
-            stance=stance,
-            phase=phase,
-            transcript_text=_render_transcript(transcript),
-            last_opponent=last_opponent_text,
-            evidence=evidence or "(no evidence retrieved)",
-            sources_block=format_sources_block(sources),
-        ),
-        schema=Argument,
-        temperature=0.6,
-    )
-    return argument, sources
+    strategy: DebateStrategy | None = None,
+    on_research_chunk: ChunkCallback = None,
+) -> tuple[Argument, list[Source], str]:  # returns (argument, sources, evidence_text)
 ```
 
-### Phase 1: Research
+The third return value `evidence_text` is now threaded back to the caller. It is used by the reflection critique to score `factual_density` accurately, and by the `_verify_claims_against_evidence()` post-audit pass.
+
+### Phase 1: Research (with optional streaming)
 
 ```python
-evidence, sources = await grounded_generate(
-    ground_topic_prompt(topic, stance, phase, last_opponent_text),
-    temperature=0.2,
-)
+if on_research_chunk is not None:
+    evidence, sources = await grounded_generate_stream(
+        grounding_prompt,
+        temperature=0.2,
+        on_chunk=on_research_chunk,
+    )
+else:
+    evidence, sources = await grounded_generate(grounding_prompt, temperature=0.2)
 ```
 
-- `ground_topic_prompt(...)` constructs the research prompt (see [05-prompts.md](./05-prompts.md)).
-- `grounded_generate()` calls Gemini with Google Search enabled.
-- Returns `evidence` (free text describing what was found) and `sources` (extracted `Source` objects with titles and URLs).
+When `on_research_chunk` is provided, Phase 1 uses `grounded_generate_stream()` so the browser receives research tokens in real time. When it is `None`, it falls back to the standard non-streaming call — identical behaviour, no performance difference.
 
 ### Phase 2: Compose
 
-```python
-argument = await structured_generate(
-    compose_argument_prompt(
-        topic=topic,
-        stance=stance,
-        phase=phase,
-        transcript_text=_render_transcript(transcript),
-        last_opponent=last_opponent_text,
-        evidence=evidence or "(no evidence retrieved)",
-        sources_block=format_sources_block(sources),
-    ),
-    schema=Argument,
-    temperature=0.6,
-)
-```
+Unchanged — `structured_generate(schema=Argument)` uses the Phase 1 evidence as context. Phase 2 cannot stream (JSON must be complete before parsing).
 
-- `compose_argument_prompt(...)` builds the composition prompt, embedding the Phase 1 evidence.
-- `structured_generate(schema=Argument)` calls Gemini with `response_schema=Argument`.
-- Returns an `Argument` instance: `argument.text` (the spoken argument, 100–220 words) and `argument.key_claims` (up to 6 checkable facts).
+### Claim Verification
 
-### `_render_transcript()` — Formatting Context
-
-```python
-def _render_transcript(transcript: list[TranscriptEntry]) -> str:
-    if not transcript:
-        return "(no turns yet)"
-    lines = []
-    for entry in transcript:
-        lines.append(f"[{entry.phase}] {entry.name} ({entry.slug}): {entry.text}")
-    return "\n\n".join(lines)
-```
-
-Formats the transcript list into a readable string for the Phase 2 prompt. The format is `[phase] Name (slug): text` — including the phase label helps the LLM understand temporal context.
+After Phase 2, `_verify_claims_against_evidence()` audits the key claims against the evidence text using a `VerifiedClaims` schema call. Any claim not traceable word-for-word to the evidence is removed and logged as a WARNING. This prevents hallucinated statistics from reaching the TTS output.
 
 ---
 
@@ -198,58 +174,90 @@ async def build_turn(
     transcript: list[TranscriptEntry],
     last_opponent_text: str | None,
     allow_fact_check: bool,
+    memory: DebateMemory | None = None,
+    on_status: StatusCallback = None,
+    on_research_chunk: ChunkCallback = None,
 ) -> tuple[str, Argument, list[Source], FactCheck | None, str | None]:
 ```
 
-The `*` in the function signature means all arguments must be passed as keyword arguments (e.g. `build_turn(topic=..., stance=..., ...)`). This prevents subtle bugs from positional argument mismatches.
+`build_turn` is a 5-step pipeline. All advanced features degrade gracefully: if any step raises an exception it is caught, logged at WARNING, and execution continues with the previous step's output.
 
-### Step 1: Pick a claim to fact-check
+The two optional callback parameters enable real-time frontend streaming:
+- `on_status` — called at each step boundary with a label string
+- `on_research_chunk` — called with Phase-1 token batches as they stream from Gemini
+
+---
+
+### Step 1: Memory Retrieval
 
 ```python
-target: tuple[str, str] | None = None
-if allow_fact_check:
-    target = _pick_opponent_claim(transcript, my_slug)
+if on_status: await on_status("retrieving_memory")
+memory_context = memory.retrieve(f"{phase} {last_opponent_text or ''}")
 ```
 
-Only done if `allow_fact_check` is `True`. Returns `(claim_text, target_slug)` or `None`.
+Retrieves up to 4 semantically similar episodes from FAISS episodic memory. These are injected into the planner as context. Skipped if `memory` is `None`.
 
-### Step 2: Launch concurrent tasks
+---
+
+### Step 2: Planner
 
 ```python
+if on_status: await on_status("planning_strategy")
+strategy = await run_planner(topic, stance, phase, my_slug, transcript,
+                             last_opponent_text, memory_context)
+```
+
+Calls the LangGraph Plan-and-Execute graph to produce a `DebateStrategy`: `primary_attack`, `evidence_keywords`, `rhetorical_angle`, `claims_to_make`, `opponent_weak_points`. The `evidence_keywords` are injected into the Phase 1 research prompt so Gemini searches for the most relevant evidence. See [planner.py](../src/planner.py).
+
+---
+
+### Step 3: Core Argument + Fact-Check (concurrent)
+
+```python
+if on_status: await on_status("researching")
 argument_task = asyncio.create_task(
-    _generate_argument_core(
-        topic=topic,
-        stance=stance,
-        phase=phase,
-        transcript=transcript,
-        last_opponent_text=last_opponent_text,
-    )
+    _generate_argument_core(..., on_research_chunk=on_research_chunk)
 )
-check_task: asyncio.Task[FactCheck] | None = None
 if target is not None:
-    claim_text, _target_slug = target
     check_task = asyncio.create_task(fact_check_claim(claim_text))
+
+argument, arg_sources, evidence = await argument_task
+if on_status: await on_status("composing_argument")
 ```
 
-Both tasks are started. If there is no claim to check, `check_task` remains `None`.
+Argument generation and fact-checking run concurrently (see concurrency pattern above). The third return value `evidence` is kept for the reflection and verification steps. `on_research_chunk` is passed through so Phase-1 tokens stream to the browser in real time.
 
-### Step 3: Collect results
+---
+
+### Step 4: Reflection
 
 ```python
-argument, arg_sources = await argument_task
-fact_check: FactCheck | None = None
-target_slug: str | None = None
-if check_task is not None and target is not None:
-    try:
-        fact_check = await check_task
-        target_slug = target[1]
-    except Exception as exc:
-        logger.warning("fact_check side-task failed: %s", exc)
+if on_status: await on_status("reflecting")
+argument = await reflect_on_argument(
+    argument, phase=phase, stance=stance,
+    last_opponent_text=last_opponent_text, evidence=evidence,
+)
 ```
 
-`await argument_task` gets the `Argument` and sources. Then `await check_task` (if it exists) gets the `FactCheck`. The `try/except` around `check_task` ensures that if fact-checking fails for any reason, the debate still gets the argument — the turn is not lost.
+Runs the LangGraph SELF-REFINE loop (up to 2 revision cycles). Skipped automatically for the opening phase. The `evidence` string is passed so the critique can accurately score `factual_density`. See [reflection.py](../src/reflection.py).
 
-### Step 4: Compose spoken text
+---
+
+### Step 5: Memory Store
+
+```python
+if on_status: await on_status("speaking")
+memory.store(TranscriptEntry(slug=my_slug, ...))
+if last_opponent_text:
+    memory.store(TranscriptEntry(slug="opponent", ...))
+memory.compress_older_phases(phase)
+```
+
+Persists both the debater's own turn and the opponent's last turn into FAISS episodic memory. Older phases are compressed to a single summary to keep the index manageable. See [memory.py](../src/memory.py).
+
+---
+
+### Spoken Output
 
 ```python
 spoken = argument.text.strip()
@@ -261,23 +269,6 @@ The spoken text is the argument text, optionally followed by the fact-check call
 
 `format_fact_check_callout()` is a pure template function (no LLM) that converts the `FactCheck` into a spoken callout phrase. See [05-prompts.md](./05-prompts.md) for the templates.
 
-### Step 5: Log and return
-
-```python
-logger.info(
-    "built turn: phase=%s slug=%s claims=%d fact_check=%s target=%s chars=%d",
-    phase,
-    my_slug,
-    len(argument.key_claims),
-    fact_check.verdict if fact_check else "NONE",
-    target_slug,
-    len(spoken),
-)
-return spoken, argument, arg_sources, fact_check, target_slug
-```
-
-The log line is diagnostic gold — you can see at a glance how many claims were extracted, what verdict the fact-check returned, and how long the spoken text is.
-
 ---
 
 ## Time Budget
@@ -286,14 +277,18 @@ A typical turn takes approximately:
 
 | Step | Duration | Notes |
 |---|---|---|
-| Phase 1 argument research | ~15–30s | Google Search + Gemini generation |
-| Phase 1 fact-check research | ~10–25s | Runs concurrently with above |
-| Phase 2 argument composition | ~5–15s | Schema-constrained, no search |
-| Phase 2 fact-check judgment | ~3–8s | Temperature=0, fast |
-| Total concurrent | ~25–45s | Max of parallel paths + Phase 2s |
+| Memory retrieval (Step 1) | ~0.5–2s | FAISS similarity search |
+| Planner (Step 2) | ~3–8s | LangGraph + ChatGoogleGenerativeAI |
+| Phase 1 argument research (Step 3) | ~15–30s | Google Search + Gemini streaming |
+| Phase 1 fact-check research (Step 3) | ~10–25s | Runs concurrently with above |
+| Phase 2 argument composition (Step 3) | ~5–15s | Schema-constrained, no search |
+| Phase 2 fact-check judgment (Step 3) | ~3–8s | Temperature=0, fast |
+| Reflection (Step 4) | ~5–15s | 0–2 critique+revise cycles |
+| Total concurrent | ~35–60s | Steps 3–4 dominate |
 
 Then the debater agent adds:
+- Text streaming to browser: ~0.5s (50ms per sentence, done before TTS)
 - TTS synthesis: ~3–10s
 - TTS audio playback: ~20–60s (100–220 word argument at ~130 WPM)
 
-Total round-trip per turn: **~50–120 seconds**. The `PER_TURN_RPC_TIMEOUT_S = 240` gives a 2× safety margin.
+Total round-trip per turn: **~60–130 seconds**. The `PER_TURN_RPC_TIMEOUT_S = 240` gives a comfortable safety margin.

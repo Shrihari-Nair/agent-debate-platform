@@ -44,7 +44,7 @@ await room.local_participant.publish_data(
 
 ## The `_publish_event()` Helper
 
-All packets go through this function in `judge_agent.py`:
+All packets from the **judge** go through this function in `judge_agent.py`:
 
 ```python
 async def _publish_event(room: rtc.Room, event: dict) -> None:
@@ -56,10 +56,12 @@ async def _publish_event(room: rtc.Room, event: dict) -> None:
             topic="debate.event",
         )
     except Exception as exc:
-        logger.debug("publish_data failed: %s", exc)
+        logger.warning("publish_data failed: %s", exc)
 ```
 
-**Fire-and-forget** means: if publishing fails (e.g. no observers, network error), the exception is silently logged and execution continues. The debate does not fail because a browser isn't watching. This is the right pattern when the data channel is a UI feature, not a critical control path.
+**Debater agents** publish streaming events using the equivalent `_publish_to_room()` helper in `debater_agent.py`. Both helpers use the same `"debate.event"` topic, so all events — from both judge and debaters — flow through the browser's single `handleEvent()` dispatcher.
+
+**Fire-and-forget** means: if publishing fails (e.g. no observers, network error), the exception is logged and execution continues. The debate does not fail because a browser isn't watching.
 
 ---
 
@@ -202,17 +204,11 @@ await _publish_event(
 ```
 
 **Browser renders:**
-A turn card with speaker name, phase label, spoken text, and up to 5 clickable citation links:
+A turn card with speaker name, phase label, spoken text, and up to 5 clickable citation links.
 
-```javascript
-case "turn_spoken":
-    turnSpoken(ev.entry);
-    break;
-```
+**Interaction with streaming events:** `turn_spoken` is the judge's canonical, post-turn event. By the time it arrives, the card may already exist (created by `turn_text_start` and populated by `turn_text_chunk`). In that case, `turnSpoken` only adds the citation links and removes the step badge — it does not replace the text body.
 
-The `key_claims` field is not shown in the browser UI (it is internal data for fact-checking). Only `text` and `citations` are displayed.
-
-**Note:** This packet arrives AFTER the audio has finished playing (because `wait_for_playout()` must complete before the RPC returns, and the packet is published after the RPC returns). So the transcript card and the audio are slightly out of sync — you hear the audio first, then the card appears.
+If no streaming events were received (fallback), `turnSpoken` creates the full card from scratch.
 
 ---
 
@@ -388,47 +384,195 @@ The `scores` array is not displayed in the current UI (only the winner name and 
 
 ---
 
+## Packet 7: `turn_text_start`
+
+**When:** Published by the debater agent **before** `build_turn()` is called — the very first thing the debater does when it receives an RPC call.
+
+**Published by:** Debater agent (`_publish_to_room`)
+
+**Schema:**
+```json
+{
+    "type": "turn_text_start",
+    "slug": "pro",
+    "name": "Alex",
+    "phase": "rebuttal_1"
+}
+```
+
+**Browser renders:**
+Creates an empty turn card with a blinking cursor. Registers the card in `state.activeTurns` keyed by `"pro:rebuttal_1"`. All subsequent streaming events for this slug+phase pair update this card.
+
+---
+
+## Packet 8: `turn_status`
+
+**When:** At each of the 7 pipeline step boundaries inside `build_turn()`.
+
+**Published by:** Debater agent via `on_status` callback
+
+**Schema:**
+```json
+{
+    "type": "turn_status",
+    "slug": "pro",
+    "name": "Alex",
+    "phase": "rebuttal_1",
+    "status": "researching"
+}
+```
+
+**Possible `status` values:** `retrieving_memory`, `planning_strategy`, `researching`, `composing_argument`, `verifying_claims`, `reflecting`, `speaking`
+
+**Browser renders:**
+Updates (or creates) a small `.step-badge` element in the card's meta row with a human-readable label (e.g. `"🔍 researching…"`). The badge is replaced on each new status, so only the current step is shown.
+
+---
+
+## Packet 9: `research_chunk`
+
+**When:** For each token batch (~80 chars) during Phase-1 Gemini streaming. Fires many times per turn (one per sentence boundary or buffer flush).
+
+**Published by:** Debater agent via `on_research_chunk` callback
+
+**Schema:**
+```json
+{
+    "type": "research_chunk",
+    "slug": "pro",
+    "name": "Alex",
+    "phase": "rebuttal_1",
+    "text": "According to a 2025 Stanford study, remote workers report 23% higher"
+}
+```
+
+**Browser renders:**
+Appends the text fragment to a collapsible `<details>` panel inside the turn card. The panel (`🔍 research notes`) is closed by default — users can expand it to read the live evidence stream.
+
+---
+
+## Packet 10: `research_done`
+
+**When:** Immediately after `build_turn()` returns (Phase-1 is complete).
+
+**Published by:** Debater agent
+
+**Schema:**
+```json
+{
+    "type": "research_done",
+    "slug": "pro",
+    "name": "Alex",
+    "phase": "rebuttal_1",
+    "sources": [
+        { "title": "Stanford Remote Work 2025", "uri": "https://..." }
+    ]
+}
+```
+
+**Browser renders:**
+Updates the research panel summary to show the source count (e.g. `"🔍 research notes (3 sources)"`) and appends clickable source links inside the panel.
+
+---
+
+## Packet 11: `turn_text_chunk`
+
+**When:** One per sentence of the spoken text, published 50ms apart after `build_turn()` returns and before TTS starts.
+
+**Published by:** Debater agent
+
+**Schema:**
+```json
+{
+    "type": "turn_text_chunk",
+    "slug": "pro",
+    "name": "Alex",
+    "phase": "rebuttal_1",
+    "text": "The evidence clearly shows that remote work increases productivity. "
+}
+```
+
+**Browser renders:**
+Appends the sentence to the `.body` of the active card and auto-scrolls. The 50ms inter-sentence delay creates a typewriter effect.
+
+---
+
+## Packet 12: `turn_text_end`
+
+**When:** After all `turn_text_chunk` packets for a turn have been sent.
+
+**Published by:** Debater agent (also published on error, to clean up a stuck cursor)
+
+**Schema:**
+```json
+{
+    "type": "turn_text_end",
+    "slug": "pro",
+    "name": "Alex",
+    "phase": "rebuttal_1"
+}
+```
+
+**Browser renders:**
+Removes the `.typing-cursor` CSS class (stops the blinking cursor) and removes the `.step-badge`. The card is now static text. TTS audio begins immediately after this packet is published.
+
+---
+
 ## Event Flow Timeline
+
+Streaming events from debater agents are interleaved with judge events:
 
 ```
 Time →
 │
-├── [debate_started]    ← just after judge opens
+├── [debate_started]          ← judge: debate begins
 │
-├── [phase_started]     ← opening
-├── [turn_spoken]       ← pro's opening
-├── [turn_spoken]       ← con's opening
+├── [phase_started]           ← judge: opening phase
 │
-├── [phase_started]     ← rebuttal_1
-├── [turn_spoken]       ← pro's rebuttal (includes fact-check callout in text)
-├── [fact_check]        ← pro's check of con's claim
-├── [turn_spoken]       ← con's rebuttal
-├── [fact_check]        ← con's check of pro's claim
-│    └── (if CONTRADICTED ≥ 0.8 found)
-│         [debater_removed]   ← pro disqualified
+├── [turn_text_start]         ← debater-pro: card created (empty)
+├── [turn_status: retrieving_memory]
+├── [turn_status: planning_strategy]
+├── [turn_status: researching]
+├── [research_chunk] ...
+├── [research_chunk] ...       ← real-time Phase-1 tokens
+├── [research_chunk] ...
+├── [turn_status: composing_argument]
+├── [turn_status: reflecting]
+├── [research_done]           ← sources attached to research panel
+├── [turn_text_chunk] ...      ← sentence 1 (50ms pacing)
+├── [turn_text_chunk] ...
+├── [turn_text_end]           ← cursor removed; TTS starts
 │
-├── [phase_started]     ← rebuttal_2 (only if > 1 debater alive)
+│   <<< audio plays here (20–60s) >>>
+│
+├── [turn_spoken]             ← judge: enriches card with citations
+├── [fact_check]              ← judge: verdict card
+│
+├── [turn_text_start]         ← debater-con: card created ...
+│   (same pattern)
 ...
-│
-├── [phase_started]     ← closing
-...
-│
 └── [verdict]
 ```
+
+Note: `turn_spoken` arrives after audio completes but text is already visible from `turn_text_chunk` events. The user sees text appear sentence-by-sentence (~0.5s total), then hears the audio, then citations are attached.
 
 ---
 
 ## Packet Ordering and Timing
 
-LiveKit's `reliable=True` data packets are delivered in order (within the same participant's stream). The judge publishes all packets sequentially (not concurrently), so the browser receives them in the exact order they were published.
+LiveKit's `reliable=True` data packets are delivered in order (within the same participant's stream). The judge and debater agents each publish sequentially within their own streams.
 
-However, there is a notable timing gap between audio and transcript:
+With streaming, the turn now follows this timing pattern:
 
-- Audio playback happens **before** the RPC returns (because `wait_for_playout()` blocks the RPC)
-- `turn_spoken` is published **after** the RPC returns
-- Result: you hear the audio, then ~1–2 seconds later the transcript card appears
+| When | What happens |
+|---|---|
+| Turn starts (before `build_turn`) | `turn_text_start` — card appears immediately |
+| During Phase-1 research (~15–30s) | `turn_status` + `research_chunk` events stream continuously |
+| After `build_turn` returns (~35–60s) | `research_done` + `turn_text_chunk` ×N + `turn_text_end` (~0.5s) |
+| TTS plays (~20–60s) | Audio heard; text already visible |
+| After playout (judge event) | `turn_spoken` enriches card with citations |
 
-This is by design — it means the card appears as a "summary" after the speech, not predictively before it.
+This is a significant UX improvement over the old behaviour where the card appeared only after the audio finished.
 
 ---
 
