@@ -21,6 +21,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 
 from dotenv import load_dotenv
 from livekit import rtc
@@ -43,6 +44,24 @@ load_dotenv()
 
 logger = logging.getLogger("debater")
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
+
+_SENTENCE_SPLIT_RE = re.compile(r'(?<=[.!?])\s+')
+
+
+async def _publish_to_room(room: rtc.Room, event: dict) -> None:
+    """Publish a live-update data packet from the debater directly to the room.
+
+    Uses the same channel / topic as the judge so the frontend can handle all
+    events in one place.  Failures are logged but never crash the pipeline.
+    """
+    try:
+        await room.local_participant.publish_data(
+            json.dumps(event).encode("utf-8"),
+            reliable=True,
+            topic="debate.event",
+        )
+    except Exception as exc:
+        logger.warning("debater: publish_to_room failed (event=%s): %s", event.get("type"), exc)
 
 
 def _parse_metadata(raw: str | None) -> dict:
@@ -128,6 +147,39 @@ async def entrypoint(ctx: JobContext) -> None:
                     code=400, message=f"invalid TurnRequest payload: {exc}"
                 ) from exc
 
+            current_phase = req.phase
+
+            # ── Create the UI card BEFORE build_turn ────────────────────────
+            # This ensures research_chunk and turn_status events (which fire
+            # during build_turn) always have a live card in activeTurns to
+            # update.  The card starts empty; text is filled in afterward.
+            await _publish_to_room(ctx.room, {
+                "type": "turn_text_start",
+                "slug": slug,
+                "name": name,
+                "phase": current_phase,
+            })
+
+            # ── Streaming callbacks ──────────────────────────────────────────
+
+            async def _on_status(label: str) -> None:
+                await _publish_to_room(ctx.room, {
+                    "type": "turn_status",
+                    "slug": slug,
+                    "name": name,
+                    "phase": current_phase,
+                    "status": label,
+                })
+
+            async def _on_research_chunk(text: str) -> None:
+                await _publish_to_room(ctx.room, {
+                    "type": "research_chunk",
+                    "slug": slug,
+                    "name": name,
+                    "phase": current_phase,
+                    "text": text,
+                })
+
             try:
                 spoken, argument, citations, fact_check, target_slug = await build_turn(
                     topic=req.topic or topic,
@@ -138,10 +190,29 @@ async def entrypoint(ctx: JobContext) -> None:
                     last_opponent_text=req.last_opponent_text,
                     allow_fact_check=req.allow_fact_check,
                     memory=debate_memory,
+                    on_status=_on_status,
+                    on_research_chunk=_on_research_chunk,
                 )
             except Exception as exc:
                 logger.exception("debater[%s] argument generation failed", slug)
+                # Clean up the pending card so the frontend doesn't show a
+                # stuck spinner.
+                await _publish_to_room(ctx.room, {
+                    "type": "turn_text_end",
+                    "slug": slug,
+                    "name": name,
+                    "phase": current_phase,
+                })
                 raise rtc.RpcError(code=500, message=f"generation failed: {exc}") from exc
+
+            # Finalize the research panel with source links.
+            await _publish_to_room(ctx.room, {
+                "type": "research_done",
+                "slug": slug,
+                "name": name,
+                "phase": current_phase,
+                "sources": [s.model_dump() for s in citations[:5]],
+            })
 
             logger.info(
                 "debater[%s] speaking %d chars (claims=%d fact_check=%s target=%s)",
@@ -152,9 +223,32 @@ async def entrypoint(ctx: JobContext) -> None:
                 target_slug,
             )
 
-            # Speak argument + optional fact-check callout, then wait for the
-            # audio to fully play before returning. The judge's RPC round-trip
-            # therefore naturally includes playout, giving clean turn boundaries.
+            # ── Stream text sentence-by-sentence BEFORE TTS starts ──────────
+            # Text is fully visible in the UI within ~500 ms, before audio
+            # begins.  The 50 ms inter-sentence pause gives the browser time
+            # to render each line incrementally (typewriter effect).
+            sentences = [s.strip() for s in _SENTENCE_SPLIT_RE.split(spoken) if s.strip()]
+            if not sentences:
+                sentences = [spoken]
+
+            for sentence in sentences:
+                await _publish_to_room(ctx.room, {
+                    "type": "turn_text_chunk",
+                    "slug": slug,
+                    "name": name,
+                    "phase": current_phase,
+                    "text": sentence + " ",
+                })
+                await asyncio.sleep(0.05)  # 50 ms — typewriter pacing
+
+            await _publish_to_room(ctx.room, {
+                "type": "turn_text_end",
+                "slug": slug,
+                "name": name,
+                "phase": current_phase,
+            })
+
+            # ── Speak ────────────────────────────────────────────────────────
             handle = await session.say(spoken, allow_interruptions=False)
             try:
                 await handle.wait_for_playout()

@@ -26,9 +26,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 
 from .fact_checker import fact_check_claim
-from .gemini_client import format_sources_block, grounded_generate, structured_generate
+from .gemini_client import (
+    format_sources_block,
+    grounded_generate,
+    grounded_generate_stream,
+    structured_generate,
+)
 from .memory import DebateMemory
 from .planner import run_planner
 from .prompts import (
@@ -41,6 +47,12 @@ from .reflection import reflect_on_argument
 from .schemas import Argument, DebateStrategy, FactCheck, Source, TranscriptEntry, VerifiedClaims
 
 logger = logging.getLogger(__name__)
+
+# Callback types for real-time frontend streaming.
+# StatusCallback receives a short label (e.g. "researching").
+# ChunkCallback receives a raw text fragment from Phase-1 streaming.
+StatusCallback = Callable[[str], Awaitable[None]] | None
+ChunkCallback = Callable[[str], Awaitable[None]] | None
 
 
 def _render_transcript(transcript: list[TranscriptEntry]) -> str:
@@ -176,20 +188,28 @@ async def _generate_argument_core(
     transcript: list[TranscriptEntry],
     last_opponent_text: str | None,
     strategy: DebateStrategy | None = None,
+    on_research_chunk: ChunkCallback = None,
 ) -> tuple[Argument, list[Source], str]:
     """Returns (argument, sources, evidence_text).
 
     evidence_text is kept for the reflection critique and claim verification.
+    When `on_research_chunk` is provided, Phase-1 streams tokens to it in
+    real-time via `grounded_generate_stream`.
     """
     logger.info(
         "core[%s/%s]: → phase-1 grounding  keywords=%s",
         phase, stance[:30],
         strategy.evidence_keywords if strategy else "(no strategy)",
     )
-    evidence, sources = await grounded_generate(
-        _build_grounding_prompt(topic, stance, phase, last_opponent_text, strategy),
-        temperature=0.2,
-    )
+    grounding_prompt = _build_grounding_prompt(topic, stance, phase, last_opponent_text, strategy)
+    if on_research_chunk is not None:
+        evidence, sources = await grounded_generate_stream(
+            grounding_prompt,
+            temperature=0.2,
+            on_chunk=on_research_chunk,
+        )
+    else:
+        evidence, sources = await grounded_generate(grounding_prompt, temperature=0.2)
     logger.info(
         "core[%s/%s]: → phase-2 composition  angle=%s  attack=%r",
         phase, stance[:30],
@@ -248,25 +268,24 @@ async def build_turn(
     last_opponent_text: str | None,
     allow_fact_check: bool,
     memory: DebateMemory | None = None,
+    on_status: StatusCallback = None,
+    on_research_chunk: ChunkCallback = None,
 ) -> tuple[str, Argument, list[Source], FactCheck | None, str | None]:
     """Compose one debater's turn end to end.
 
-    Pipeline (all new features degrade gracefully on error):
-      1. Memory retrieval  → context injected into planner
-      2. Planner           → DebateStrategy for enriched prompts
-      3. Core argument + fact-check (concurrent, existing pipeline)
-      4. Reflection        → SELF-REFINE loop (skipped for opening)
-      5. Memory store      → persist this turn + opponent turn
+    Optional callbacks for real-time frontend streaming:
+      on_status(label)        — called at each pipeline step boundary
+      on_research_chunk(text) — called with raw Phase-1 token batches
 
-    Returns:
-      spoken_text    — the full utterance to send to TTS (argument + optional callout)
-      argument       — the structured Argument (text + key_claims)
-      citations      — grounding sources for the argument
-      fact_check     — the debater's verdict on an opponent claim (or None)
-      target_slug    — which opponent's claim was checked (or None)
+    All callbacks degrade gracefully: exceptions are caught and logged.
     """
     # ── Step 1: Memory retrieval ─────────────────────────────────────────────
     logger.info("[1/5] build_turn[%s/%s]: starting — memory retrieval", my_slug, phase)
+    if on_status:
+        try:
+            await on_status("retrieving_memory")
+        except Exception:
+            pass
     memory_context: list[str] = []
     if memory is not None:
         try:
@@ -283,6 +302,11 @@ async def build_turn(
 
     # ── Step 2: Planner — produce DebateStrategy ─────────────────────────────
     logger.info("[2/5] build_turn[%s/%s]: running planner", my_slug, phase)
+    if on_status:
+        try:
+            await on_status("planning_strategy")
+        except Exception:
+            pass
     strategy: DebateStrategy | None = None
     try:
         strategy = await run_planner(
@@ -306,6 +330,11 @@ async def build_turn(
 
     # ── Step 3: Core argument + optional fact-check (concurrent) ────────────
     logger.info("[3/5] build_turn[%s/%s]: launching core generation (concurrent)", my_slug, phase)
+    if on_status:
+        try:
+            await on_status("researching")
+        except Exception:
+            pass
     target: tuple[str, str] | None = None
     if allow_fact_check:
         target = _pick_opponent_claim(transcript, my_slug)
@@ -325,6 +354,7 @@ async def build_turn(
             transcript=transcript,
             last_opponent_text=last_opponent_text,
             strategy=strategy,
+            on_research_chunk=on_research_chunk,
         )
     )
     check_task: asyncio.Task[FactCheck] | None = None
@@ -333,6 +363,11 @@ async def build_turn(
         check_task = asyncio.create_task(fact_check_claim(claim_text))
 
     argument, arg_sources, evidence = await argument_task
+    if on_status:
+        try:
+            await on_status("composing_argument")
+        except Exception:
+            pass
     logger.info(
         "[3/5] build_turn[%s/%s]: core argument ✓  chars=%d  claims=%d  sources=%d",
         my_slug, phase, len(argument.text), len(argument.key_claims), len(arg_sources),
@@ -352,6 +387,11 @@ async def build_turn(
 
     # ── Step 4: Reflection — SELF-REFINE loop ───────────────────────────────
     logger.info("[4/5] build_turn[%s/%s]: running reflection loop", my_slug, phase)
+    if on_status:
+        try:
+            await on_status("reflecting")
+        except Exception:
+            pass
     try:
         argument_before = argument.text
         argument = await reflect_on_argument(
@@ -406,6 +446,11 @@ async def build_turn(
         logger.debug("[5/5] build_turn[%s/%s]: no memory instance — skipping store", my_slug, phase)
 
     # ── Compose spoken output ────────────────────────────────────────────────
+    if on_status:
+        try:
+            await on_status("speaking")
+        except Exception:
+            pass
     spoken = argument.text.strip()
     if fact_check is not None:
         spoken = spoken + "\n\n" + format_fact_check_callout(fact_check)

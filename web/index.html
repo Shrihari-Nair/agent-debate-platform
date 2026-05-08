@@ -70,6 +70,14 @@
       .cites a:hover { text-decoration: underline; }
       .status { font-size: 12px; color: var(--muted); padding: 8px 10px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; }
       .danger { color: var(--bad); }
+      /* Streaming / live-update styles */
+      @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
+      .typing-cursor .body::after { content: "▋"; animation: blink 1s step-end infinite; color: var(--accent); font-size: 0.85em; }
+      .step-badge { font-size: 11px; color: var(--accent); opacity: 0.85; margin-left: 4px; }
+      .research-panel { margin-top: 8px; font-size: 12px; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+      .research-panel summary { cursor: pointer; color: var(--muted); font-size: 12px; padding: 4px 8px; user-select: none; background: var(--panel-2); }
+      .research-panel summary:hover { color: var(--accent); }
+      .research-panel .research-text { padding: 6px 8px; line-height: 1.5; color: var(--muted); max-height: 130px; overflow-y: auto; white-space: pre-wrap; font-size: 11.5px; }
     </style>
   </head>
   <body>
@@ -128,7 +136,36 @@
         room: null,
         participants: new Map(), // identity -> { role, name, stance, removed }
         turns: [],
+        activeTurns: new Map(), // "slug:phase" -> DOM card element (while streaming)
       };
+
+      // Human-readable labels for pipeline status events.
+      const STATUS_LABELS = {
+        retrieving_memory: "🧠 recalling…",
+        planning_strategy: "🗺 planning…",
+        researching: "🔍 researching…",
+        composing_argument: "✍ composing…",
+        verifying_claims: "🔬 verifying…",
+        reflecting: "🔄 reflecting…",
+        speaking: "🎙 speaking…",
+      };
+
+      function _activeKey(slug, phase) {
+        return `${slug || "?"}:${phase || "?"}`;
+      }
+
+      function _getOrCreateResearchPanel(card) {
+        let panel = card.querySelector(".research-panel");
+        if (!panel) {
+          panel = document.createElement("details");
+          panel.className = "research-panel";
+          panel.innerHTML = `<summary>🔍 research notes</summary><div class="research-text"></div>`;
+          const cites = card.querySelector(".cites");
+          if (cites) card.insertBefore(panel, cites);
+          else card.appendChild(panel);
+        }
+        return panel;
+      }
 
       const $ = (id) => document.getElementById(id);
 
@@ -217,18 +254,116 @@
       }
 
       function turnSpoken(entry) {
+        // If streaming cards already populated this turn, enrich them with
+        // citations from the judge's canonical event rather than duplicating.
+        const key = _activeKey(entry.slug, entry.phase);
+        const existing = state.activeTurns.get(key);
+        if (existing) {
+          existing.classList.remove("typing-cursor");
+          const badge = existing.querySelector(".step-badge");
+          if (badge) badge.remove();
+          if (!existing.querySelector(".cites")) {
+            const cites = (entry.citations || [])
+              .slice(0, 5)
+              .map((s, i) => `<a href="${s.uri}" target="_blank" rel="noopener">[${i + 1}] ${escapeHtml((s.title || s.uri).slice(0, 80))}</a>`)
+              .join(" ");
+            if (cites) {
+              const citesEl = document.createElement("div");
+              citesEl.className = "cites";
+              citesEl.innerHTML = cites;
+              existing.appendChild(citesEl);
+            }
+          }
+          state.activeTurns.delete(key);
+          return;
+        }
+        // Fallback: streaming events weren't received — build full card.
         const div = document.createElement("div");
         div.className = "turn";
         const cites = (entry.citations || [])
           .slice(0, 5)
-          .map((s, i) => `<a href="${s.uri}" target="_blank" rel="noopener">[${i + 1}] ${(s.title || s.uri).slice(0, 80)}</a>`)
+          .map((s, i) => `<a href="${s.uri}" target="_blank" rel="noopener">[${i + 1}] ${escapeHtml((s.title || s.uri).slice(0, 80))}</a>`)
           .join(" ");
         div.innerHTML = `
-          <div class="meta"><strong>${entry.name}</strong> <span>· ${entry.phase}</span></div>
+          <div class="meta"><strong>${escapeHtml(entry.name)}</strong> <span>· ${escapeHtml(entry.phase)}</span></div>
           <div class="body">${escapeHtml(entry.text)}</div>
           ${cites ? `<div class="cites">${cites}</div>` : ""}
         `;
         appendTurn(div);
+      }
+
+      function turnTextStart(ev) {
+        const div = document.createElement("div");
+        div.className = "turn typing-cursor";
+        div.innerHTML = `
+          <div class="meta">
+            <strong>${escapeHtml(ev.name || ev.slug)}</strong>
+            <span>· ${escapeHtml(ev.phase)}</span>
+          </div>
+          <div class="body"></div>
+        `;
+        appendTurn(div);
+        state.activeTurns.set(_activeKey(ev.slug, ev.phase), div);
+      }
+
+      function turnTextChunk(ev) {
+        const card = state.activeTurns.get(_activeKey(ev.slug, ev.phase));
+        if (!card) return;
+        const body = card.querySelector(".body");
+        if (body) body.textContent += ev.text;
+        const root = $("transcript");
+        root.scrollTop = root.scrollHeight;
+      }
+
+      function turnTextEnd(ev) {
+        const card = state.activeTurns.get(_activeKey(ev.slug, ev.phase));
+        if (!card) return;
+        card.classList.remove("typing-cursor");
+        const badge = card.querySelector(".step-badge");
+        if (badge) badge.remove();
+      }
+
+      function turnStatus(ev) {
+        const card = state.activeTurns.get(_activeKey(ev.slug, ev.phase));
+        if (!card) return;
+        let badge = card.querySelector(".step-badge");
+        if (!badge) {
+          badge = document.createElement("span");
+          badge.className = "step-badge";
+          const meta = card.querySelector(".meta");
+          if (meta) meta.appendChild(badge);
+        }
+        badge.textContent = STATUS_LABELS[ev.status] || ev.status;
+      }
+
+      function researchChunk(ev) {
+        const card = state.activeTurns.get(_activeKey(ev.slug, ev.phase));
+        if (!card) return;
+        const panel = _getOrCreateResearchPanel(card);
+        const textEl = panel.querySelector(".research-text");
+        if (textEl) {
+          textEl.textContent += ev.text;
+          textEl.scrollTop = textEl.scrollHeight;
+        }
+      }
+
+      function researchDone(ev) {
+        const card = state.activeTurns.get(_activeKey(ev.slug, ev.phase));
+        if (!card) return;
+        const panel = _getOrCreateResearchPanel(card);
+        const summary = panel.querySelector("summary");
+        const srcs = ev.sources || [];
+        if (summary) summary.textContent = `🔍 research notes (${srcs.length} source${srcs.length !== 1 ? "s" : ""})`;
+        if (srcs.length > 0) {
+          const citesEl = document.createElement("div");
+          citesEl.className = "cites";
+          citesEl.style.padding = "4px 8px 6px";
+          citesEl.innerHTML = srcs
+            .slice(0, 5)
+            .map((s, i) => `<a href="${s.uri}" target="_blank" rel="noopener">[${i + 1}] ${escapeHtml((s.title || s.uri).slice(0, 80))}</a>`)
+            .join(" ");
+          panel.appendChild(citesEl);
+        }
       }
 
       function factCheck(ev) {
@@ -326,6 +461,13 @@
           case "verdict":
             verdictNote(ev);
             break;
+          // ── Real-time streaming events from debater agents ──────────────
+          case "turn_status":    turnStatus(ev);    break;
+          case "research_chunk": researchChunk(ev); break;
+          case "research_done":  researchDone(ev);  break;
+          case "turn_text_start": turnTextStart(ev); break;
+          case "turn_text_chunk": turnTextChunk(ev); break;
+          case "turn_text_end":   turnTextEnd(ev);   break;
         }
       }
 

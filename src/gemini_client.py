@@ -6,11 +6,18 @@ in a single call (`python-genai#58`). The entire debate system is therefore
 built on a two-phase pattern: a grounded call for evidence, then an ungrounded
 schema-constrained call for structured output. Both phases go through the
 `google.genai.Client.aio` async API we expose here.
+
+Streaming:
+  `grounded_generate_stream` wraps Phase-1 with an `on_chunk` callback so the
+  debater agent can publish research tokens to the room in real-time before the
+  full evidence text is assembled.  Phase-2 (schema-constrained) cannot stream
+  because the JSON must be complete before it can be parsed.
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Awaitable, Callable
 from functools import lru_cache
 
 from google import genai
@@ -84,6 +91,69 @@ async def grounded_generate(prompt: str, temperature: float = 0.2) -> tuple[str,
         len(text), len(sources),
     )
     return text, sources
+
+
+async def grounded_generate_stream(
+    prompt: str,
+    temperature: float = 0.2,
+    on_chunk: Callable[[str], Awaitable[None]] | None = None,
+) -> tuple[str, list[Source]]:
+    """Phase 1 with streaming: calls `on_chunk(text)` for each token batch.
+
+    Identical semantics to `grounded_generate` — same return type, same
+    Google Search grounding.  The `on_chunk` callback is fire-and-forget per
+    chunk; exceptions in the callback are logged and swallowed so a broken
+    observer never kills the generation pipeline.
+
+    Grounding metadata (sources) arrives only in the final chunk, so sources
+    are extracted from the last seen response object.
+    """
+    logger.info(
+        "gemini[phase-1/stream]: → calling model=%s  prompt_chars=%d  temp=%.1f",
+        settings.debate_model, len(prompt), temperature,
+    )
+    client = get_client()
+
+    full_text = ""
+    last_chunk = None
+    chunk_count = 0
+    _batch = ""  # accumulate small SDK fragments before calling on_chunk
+
+    async for chunk in await client.aio.models.generate_content_stream(
+        model=settings.debate_model,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            tools=[_google_search_tool()],
+            temperature=temperature,
+        ),
+    ):
+        last_chunk = chunk
+        token = chunk.text or ""
+        if token:
+            full_text += token
+            _batch += token
+            # Fire callback when batch is large enough (~80 chars) or ends a sentence
+            if on_chunk is not None and (len(_batch) >= 80 or token[-1] in ".!?\n"):
+                try:
+                    await on_chunk(_batch)
+                except Exception as cb_exc:
+                    logger.debug("gemini[phase-1/stream]: on_chunk callback error: %s", cb_exc)
+                _batch = ""
+                chunk_count += 1
+
+    # Flush any remaining buffer
+    if on_chunk is not None and _batch:
+        try:
+            await on_chunk(_batch)
+        except Exception as cb_exc:
+            logger.debug("gemini[phase-1/stream]: on_chunk flush error: %s", cb_exc)
+
+    sources = extract_sources(last_chunk) if last_chunk else []
+    logger.info(
+        "gemini[phase-1/stream]: ✓ complete  evidence_chars=%d  sources=%d  batches=%d",
+        len(full_text), len(sources), chunk_count,
+    )
+    return full_text, sources
 
 
 async def structured_generate(
