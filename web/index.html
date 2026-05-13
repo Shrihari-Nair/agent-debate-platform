@@ -94,13 +94,21 @@
           <label for="topic">Topic</label>
           <textarea id="topic" rows="2">Should AI agents be allowed to vote in online communities?</textarea>
         </div>
-        <h2>Debaters (2-4)</h2>
-        <div class="debaters" id="debaters"></div>
-        <button class="pill-btn" id="add-debater" type="button">+ Add debater</button>
+        <div class="field" style="margin-top:10px">
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px">
+            <input type="checkbox" id="auto-mode" checked />
+            <span>Let the judge decide positions automatically</span>
+          </label>
+        </div>
+        <div id="manual-debaters" style="display:none">
+          <h2 style="margin-top:14px">Debaters (2-4)</h2>
+          <div class="debaters" id="debaters"></div>
+          <button class="pill-btn" id="add-debater" type="button">+ Add debater</button>
+        </div>
         <div style="margin-top: 14px">
           <button id="start-btn" type="button">Start debate</button>
         </div>
-        <div style="margin-top: 16px" class="status" id="ctrl-status">Fill in a topic + at least 2 debaters.</div>
+        <div style="margin-top: 16px" class="status" id="ctrl-status">Enter a topic — the judge will decide the positions.</div>
 
         <h2 style="margin-top: 24px">Participants</h2>
         <div class="participants" id="participants"></div>
@@ -210,7 +218,16 @@
       const debaters = [...DEFAULT_DEBATERS];
       renderDebaters(debaters);
 
-      $("add-debater").addEventListener("click", () => {
+      // Toggle debater form visibility based on auto-mode checkbox.
+      $('auto-mode').addEventListener('change', () => {
+        const auto = $('auto-mode').checked;
+        $('manual-debaters').style.display = auto ? 'none' : '';
+        $('ctrl-status').textContent = auto
+          ? 'Enter a topic — the judge will decide the positions.'
+          : 'Fill in a topic + at least 2 debaters.';
+      });
+
+      $('add-debater').addEventListener('click', () => {
         if (debaters.length >= 4) return;
         debaters.push({
           slug: `pos${debaters.length + 1}`,
@@ -468,24 +485,53 @@
           case "turn_text_start": turnTextStart(ev); break;
           case "turn_text_chunk": turnTextChunk(ev); break;
           case "turn_text_end":   turnTextEnd(ev);   break;
+          // ── Auto-mode events from the judge ────────────────────────────
+          case "analyzing_topic": {
+            const el = document.createElement('div');
+            el.className = 'turn phase';
+            el.textContent = '— judge is analysing topic —';
+            appendTurn(el);
+            break;
+          }
+          case "positions_decided": {
+            // Enrich the placeholder phase row.
+            const last = $('transcript').querySelector('.turn.phase:last-of-type');
+            if (last) last.textContent = `— judge decided ${(ev.debaters||[]).length} positions —`;
+            // Pre-seed participant cards exactly like debate_started does.
+            (ev.debaters || []).forEach((d) => {
+              const identity = `debater-${d.slug}`;
+              const existing = state.participants.get(identity) || {};
+              state.participants.set(identity, {
+                ...existing,
+                role: 'debater',
+                name: d.name,
+                slug: d.slug,
+                stance: d.stance,
+              });
+            });
+            renderParticipants();
+            $('ctrl-status').textContent = 'Positions decided — debaters connecting…';
+            break;
+          }
         }
       }
 
       async function startDebate() {
-        $("start-btn").disabled = true;
-        $("ctrl-status").textContent = "Creating room and dispatching agents...";
+        $('start-btn').disabled = true;
+        $('ctrl-status').textContent = 'Creating room and dispatching agents...';
+        const autoMode = $('auto-mode').checked;
         try {
-          const payload = {
-            topic: $("topic").value.trim(),
-            debaters: debaters.map((d) => ({
+          const payload = { topic: $('topic').value.trim() };
+          if (!autoMode) {
+            payload.debaters = debaters.map((d) => ({
               slug: d.slug.trim(),
               name: d.name.trim(),
               stance: d.stance.trim(),
-            })),
-          };
+            }));
+          }
           const res = await fetch(`${ORCHESTRATOR_URL}/debate`, {
-            method: "POST",
-            headers: { "content-type": "application/json" },
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
             body: JSON.stringify(payload),
           });
           if (!res.ok) {
@@ -493,13 +539,15 @@
             throw new Error(err || `HTTP ${res.status}`);
           }
           const data = await res.json();
-          $("room-tag").textContent = data.room;
-          $("room-tag").style.display = "inline-block";
-          $("ctrl-status").textContent = `Connected to ${data.room}.`;
+          $('room-tag').textContent = data.room;
+          $('room-tag').style.display = 'inline-block';
+          $('ctrl-status').textContent = `Connected to ${data.room}.${
+            autoMode ? ' Waiting for judge to decide positions…' : ''
+          }`;
           await connectToRoom(data.ws_url, data.observer_token);
         } catch (e) {
-          $("ctrl-status").innerHTML = `<span class="danger">Error: ${escapeHtml(e.message)}</span>`;
-          $("start-btn").disabled = false;
+          $('ctrl-status').innerHTML = `<span class="danger">Error: ${escapeHtml(e.message)}</span>`;
+          $('start-btn').disabled = false;
         }
       }
 

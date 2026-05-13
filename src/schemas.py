@@ -44,6 +44,53 @@ class DebaterSpec(BaseModel):
     )
 
 
+class AutoDebaterSpec(BaseModel):
+    """Gemini structured-output for a single debater in auto-mode.
+
+    Intentionally less strict than DebaterSpec (no slug pattern) because the
+    LLM output is post-processed to normalize slugs before constructing
+    DebaterSpec instances.
+    """
+
+    slug: str = Field(
+        description=(
+            "Unique short identifier. Use only lowercase letters, digits, and "
+            "hyphens — no spaces or underscores. Examples: 'pro', 'con', "
+            "'techno-opt', 'status-quo'."
+        )
+    )
+    name: str = Field(
+        description="Display name with a short descriptor, e.g. 'Alex (Pro-Regulation)'."
+    )
+    stance: str = Field(
+        description=(
+            "One sentence stating the position this debater will argue for, "
+            "beginning with a strong assertion."
+        )
+    )
+
+
+class DebateSetup(BaseModel):
+    """Gemini structured-output for auto-configuring a debate from a topic alone.
+
+    Used by the judge agent in auto-mode to decide how many sides the topic
+    warrants (2-4) and what each side argues.
+    """
+
+    debaters: list[AutoDebaterSpec] = Field(
+        min_length=2,
+        max_length=4,
+        description="2-4 debaters with mutually exclusive, non-overlapping stances.",
+    )
+    rationale: str = Field(
+        description=(
+            "2-3 natural spoken sentences explaining the chosen positions and "
+            "why they represent the core disagreement. Will be read aloud by "
+            "the judge before the debate begins."
+        )
+    )
+
+
 class DebateConfig(BaseModel):
     topic: str = Field(min_length=3, max_length=500)
     debaters: list[DebaterSpec] = Field(min_length=2, max_length=4)
@@ -52,7 +99,7 @@ class DebateConfig(BaseModel):
 
 class CreateDebateRequest(BaseModel):
     topic: str
-    debaters: list[DebaterSpec]
+    debaters: list[DebaterSpec] | None = None  # None = judge auto-decides positions
 
 
 class CreateDebateResponse(BaseModel):
@@ -60,7 +107,7 @@ class CreateDebateResponse(BaseModel):
     ws_url: str
     observer_token: str
     observer_identity: str
-    debate: DebateConfig
+    debate: DebateConfig | None = None  # None in auto-mode (judge decides positions)
 
 
 class TranscriptEntry(BaseModel):

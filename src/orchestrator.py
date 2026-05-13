@@ -101,24 +101,36 @@ async def healthz() -> dict:
 async def create_debate(req: CreateDebateRequest) -> CreateDebateResponse:
     _require_livekit_env()
 
-    if len(req.debaters) < 2:
-        raise HTTPException(400, "Need at least 2 debaters")
-    if len(req.debaters) > 4:
-        raise HTTPException(400, "At most 4 debaters supported")
+    auto_mode = not req.debaters
 
-    slugs = [d.slug for d in req.debaters]
-    if len(set(slugs)) != len(slugs):
-        raise HTTPException(400, "Debater slugs must be unique")
+    if not auto_mode:
+        if len(req.debaters) < 2:
+            raise HTTPException(400, "Need at least 2 debaters")
+        if len(req.debaters) > 4:
+            raise HTTPException(400, "At most 4 debaters supported")
+        slugs = [d.slug for d in req.debaters]
+        if len(set(slugs)) != len(slugs):
+            raise HTTPException(400, "Debater slugs must be unique")
 
     room_name = f"debate-{uuid.uuid4().hex[:8]}"
-    config = DebateConfig(topic=req.topic, debaters=req.debaters, phases=list(DEFAULT_PHASES))
 
-    logger.info(
-        "creating debate: room=%s topic=%r debaters=%s",
-        room_name,
-        req.topic,
-        slugs,
-    )
+    if auto_mode:
+        # Judge metadata contains only topic + phases; debaters are decided by the judge.
+        judge_meta = {"topic": req.topic, "phases": list(DEFAULT_PHASES)}
+        response_debate = None
+        logger.info("creating debate (auto-mode): room=%s topic=%r", room_name, req.topic)
+    else:
+        config = DebateConfig(
+            topic=req.topic, debaters=req.debaters, phases=list(DEFAULT_PHASES)
+        )
+        judge_meta = config.model_dump()
+        response_debate = config
+        logger.info(
+            "creating debate (manual): room=%s topic=%r debaters=%s",
+            room_name,
+            req.topic,
+            [d.slug for d in req.debaters],
+        )
 
     async with api.LiveKitAPI(
         url=settings.livekit_url,
@@ -129,38 +141,40 @@ async def create_debate(req: CreateDebateRequest) -> CreateDebateResponse:
             api.CreateRoomRequest(
                 name=room_name,
                 empty_timeout=10 * 60,
-                max_participants=1 + len(req.debaters) + 10,  # judge + debaters + observers
+                # judge + up to 4 debaters + 10 observers
+                max_participants=15,
                 metadata=json.dumps({"topic": req.topic}),
             )
         )
 
-        # Dispatch the judge with the full debate config so it knows who to
-        # expect and how to run the phases.
+        # Dispatch the judge. In auto-mode the judge's metadata has no "debaters"
+        # key, which triggers the auto-setup path in judge_agent.entrypoint().
         await lkapi.agent_dispatch.create_dispatch(
             api.CreateAgentDispatchRequest(
                 agent_name="judge",
                 room=room_name,
-                metadata=json.dumps(config.model_dump()),
+                metadata=json.dumps(judge_meta),
             )
         )
 
-        # Dispatch one debater worker per position. Each becomes its own job
-        # process and joins the room with identity `debater-<slug>`.
-        for spec in req.debaters:
-            await lkapi.agent_dispatch.create_dispatch(
-                api.CreateAgentDispatchRequest(
-                    agent_name="debater",
-                    room=room_name,
-                    metadata=json.dumps(
-                        {
-                            "slug": spec.slug,
-                            "name": spec.name,
-                            "stance": spec.stance,
-                            "topic": req.topic,
-                        }
-                    ),
+        # Dispatch debater workers only in manual mode.
+        # In auto-mode the judge dispatches them after deciding positions.
+        if not auto_mode:
+            for spec in req.debaters:
+                await lkapi.agent_dispatch.create_dispatch(
+                    api.CreateAgentDispatchRequest(
+                        agent_name="debater",
+                        room=room_name,
+                        metadata=json.dumps(
+                            {
+                                "slug": spec.slug,
+                                "name": spec.name,
+                                "stance": spec.stance,
+                                "topic": req.topic,
+                            }
+                        ),
+                    )
                 )
-            )
 
     identity, token = _mint_observer_token(room_name)
     return CreateDebateResponse(
@@ -168,7 +182,7 @@ async def create_debate(req: CreateDebateRequest) -> CreateDebateResponse:
         ws_url=settings.livekit_url,
         observer_token=token,
         observer_identity=identity,
-        debate=config,
+        debate=response_debate,
     )
 
 

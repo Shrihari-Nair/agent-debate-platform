@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import pathlib
+import re
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
@@ -41,9 +42,10 @@ from livekit.plugins import cartesia
 from .config import settings
 from .gemini_client import structured_generate
 from .personas import JUDGE_VOICE
-from .prompts import final_verdict_prompt
+from .prompts import analyze_topic_prompt, final_verdict_prompt
 from .schemas import (
     DEFAULT_PHASES,
+    DebateSetup,
     DebaterSpec,
     FactCheck,
     FinalVerdict,
@@ -187,20 +189,107 @@ def _persist_run(room_name: str, payload: dict) -> None:
     logger.info("judge: wrote transcript to %s", out)
 
 
+_SLUG_CLEAN_RE = re.compile(r"[^a-z0-9-]")
+
+
+async def _auto_setup_debate(
+    ctx: JobContext,
+    topic: str,
+    session: AgentSession,
+) -> list[DebaterSpec] | None:
+    """Analyse the topic with Gemini, decide positions, and dispatch debater workers.
+
+    Returns the list of DebaterSpecs on success, None on unrecoverable error.
+    The caller must not proceed with the debate if None is returned.
+    """
+    logger.info("judge: auto-setup — analysing topic %r", topic)
+    await _publish_event(ctx.room, {"type": "analyzing_topic", "topic": topic})
+
+    try:
+        setup = await structured_generate(
+            analyze_topic_prompt(topic),
+            schema=DebateSetup,
+            temperature=0.3,
+        )
+    except Exception:
+        logger.exception("judge: auto-setup Gemini call failed")
+        await session.say(
+            "I'm sorry, I was unable to analyse the debate topic. "
+            "Please try again with a more specific topic."
+        )
+        return None
+
+    # Normalise slugs: strip invalid chars, collapse hyphens, fallback to positional.
+    debaters: list[DebaterSpec] = []
+    for i, d in enumerate(setup.debaters):
+        raw = d.slug.lower().strip()
+        clean = _SLUG_CLEAN_RE.sub("-", raw).strip("-")
+        clean = re.sub(r"-{2,}", "-", clean) or f"pos{i + 1}"
+        try:
+            debaters.append(DebaterSpec(slug=clean, name=d.name, stance=d.stance))
+        except Exception as exc:
+            logger.warning("judge: auto-setup bad debater spec (slug=%r): %s", clean, exc)
+            debaters.append(
+                DebaterSpec(slug=f"pos{i + 1}", name=d.name, stance=d.stance)
+            )
+
+    logger.info(
+        "judge: auto-setup decided %d debaters: %s",
+        len(debaters),
+        [(d.slug, d.name) for d in debaters],
+    )
+
+    # Announce the chosen positions before the workers connect.
+    await session.say(setup.rationale)
+    await _publish_event(
+        ctx.room,
+        {"type": "positions_decided", "debaters": [d.model_dump() for d in debaters]},
+    )
+
+    # Dispatch one debater worker per position using the LiveKit server API.
+    try:
+        async with api.LiveKitAPI(
+            url=settings.livekit_url,
+            api_key=settings.livekit_api_key,
+            api_secret=settings.livekit_api_secret,
+        ) as lkapi:
+            for spec in debaters:
+                await lkapi.agent_dispatch.create_dispatch(
+                    api.CreateAgentDispatchRequest(
+                        agent_name="debater",
+                        room=ctx.room.name,
+                        metadata=json.dumps({
+                            "slug": spec.slug,
+                            "name": spec.name,
+                            "stance": spec.stance,
+                            "topic": topic,
+                        }),
+                    )
+                )
+                logger.info(
+                    "judge: dispatched debater slug=%s name=%r", spec.slug, spec.name
+                )
+    except Exception:
+        logger.exception("judge: auto-setup dispatch failed")
+        await session.say(
+            "I was unable to bring in the debaters due to a system error. "
+            "Please try again."
+        )
+        return None
+
+    return debaters
+
+
 async def entrypoint(ctx: JobContext) -> None:
     meta = _parse_metadata(ctx.job.metadata)
     topic: str = meta.get("topic") or "(unspecified topic)"
     phases: list[str] = meta.get("phases") or list(DEFAULT_PHASES)
     raw_debaters = meta.get("debaters") or []
-    debaters: list[DebaterSpec] = [DebaterSpec(**d) for d in raw_debaters]
-    if len(debaters) < 2:
-        logger.error("judge: need at least 2 debaters in metadata, got %d", len(debaters))
-        return
 
     logger.info(
-        "judge starting: topic=%r debaters=%s phases=%s",
+        "judge starting: topic=%r auto_mode=%s phases=%s",
         topic,
-        [d.slug for d in debaters],
+        not raw_debaters,
         phases,
     )
 
@@ -224,6 +313,31 @@ async def entrypoint(ctx: JobContext) -> None:
         )
     )
     await session.start(room=ctx.room, agent=agent)
+
+    # ── Resolve debaters ───────────────────────────────────────────────────
+    if raw_debaters:
+        # Manual mode: debaters were specified by the user via the orchestrator.
+        debaters: list[DebaterSpec] = [DebaterSpec(**d) for d in raw_debaters]
+        if len(debaters) < 2:
+            logger.error(
+                "judge: need at least 2 debaters in metadata, got %d", len(debaters)
+            )
+            return
+    else:
+        # Auto-mode: judge analyses the topic, decides positions, and spawns workers.
+        await session.say(
+            f"I've received the debate topic: {topic}. "
+            "Give me a moment to determine the best positions for this debate."
+        )
+        debaters = await _auto_setup_debate(ctx, topic, session)
+        if debaters is None:
+            return  # error already spoken
+
+    logger.info(
+        "judge: debaters resolved — %s phases=%s",
+        [d.slug for d in debaters],
+        phases,
+    )
 
     # 1. Wait for every debater to connect.
     logger.info("judge: waiting for debaters to join...")

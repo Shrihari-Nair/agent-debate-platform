@@ -229,6 +229,27 @@ FACT_CHECK_CALLOUT: dict[str, str] = {
 }
 
 
+def analyze_topic_prompt(topic: str) -> str:
+    """Prompt for the judge's auto-setup step: decide sides and stances from the topic alone."""
+    return (
+        f"Today's date: {_today()}.\n"
+        f'You are organising a structured debate on the topic: "{topic}"\n\n'
+        "Decide how many genuinely distinct, mutually exclusive sides exist "
+        "(minimum 2, maximum 4), then define each side.\n\n"
+        "Rules:\n"
+        "1. Binary topics (for/against, yes/no, should/should not) \u2192 exactly 2 sides.\n"
+        "2. Use 3 only if a third position is clearly irreducible to either main side.\n"
+        "3. Use 4 only for topics where four non-overlapping perspectives are all meaningful.\n"
+        "4. No two stances may agree, overlap, or lead to the same conclusion.\n"
+        "5. Each stance must be one sentence beginning with a strong assertion.\n"
+        "6. Slugs: lowercase letters, digits, and hyphens ONLY \u2014 no spaces or underscores "
+        "(e.g. 'pro', 'con', 'techno-opt', 'status-quo').\n"
+        "7. Names: include a short descriptor, e.g. 'Alex (Pro-Regulation)'.\n"
+        "8. Rationale: 2-3 natural spoken sentences (no markdown) introducing the "
+        "positions to a live audience \u2014 this will be read aloud by the judge."
+    )
+
+
 def format_fact_check_callout(fc) -> str:
     template = FACT_CHECK_CALLOUT.get(fc.verdict, FACT_CHECK_CALLOUT["UNVERIFIABLE"])
     evidence = (fc.evidence_summary or "").strip()
